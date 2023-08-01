@@ -3,38 +3,41 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from qkeras import *
+from qkeras import QActivation,QConv2D,QDense,quantized_bits
+import qkeras
 from keras.models import Model
 from keras.layers import *
 from telescope import *
-
+from utils import *
 import os
 import sys
-import utils
-p = utils.ArgumentParser()
+
+p = ArgumentParser()
 p.add_args(
     ('--mname', p.STR),
     ('--loss', p.STR), ('--nepochs', p.INT),
     ('--opath', p.STR),
     ('--mpath', p.STR),('--prepath', p.STR),('--continue_training', p.STORE_TRUE), ('--batchsize', p.INT),
     ('--lr', {'type': float}),
-    ('--num_files', p.INT),
+    ('--num_files', p.INT),('--pretrain_model', p.STORE_TRUE),('--optim', p.STR)
     
     
     
 )
 
-remap_9x9 = [
-    4, 13, 22, 31, 5, 14, 23, 32, 6, 15, 24, 33, 7, 16, 25, 34,
-    27, 28, 29, 30, 18, 19, 20, 21, 9, 10, 11, 12, 0, 1, 2, 3,
-    66, 57, 48, 40, 65, 56, 50, 49, 64, 60, 59, 58, 70, 69, 68, 67
-]
+# remap_9x9 = [
+#     4, 13, 22, 31, 5, 14, 23, 32, 6, 15, 24, 33, 7, 16, 25, 34,
+#     27, 28, 29, 30, 18, 19, 20, 21, 9, 10, 11, 12, 0, 1, 2, 3,
+#     66, 57, 48, 40, 65, 56, 50, 49, 64, 60, 59, 58, 70, 69, 68, 67
+# ]
 
-remap_9x9_matrix = np.zeros(48*81,dtype=np.float32).reshape((81,48))
+# remap_9x9_matrix = np.zeros(48*81,dtype=np.float32).reshape((81,48))
 
-for i in range(48): 
-    remap_9x9_matrix[remap_9x9[i],i] = 1
+# for i in range(48): 
+#     remap_9x9_matrix[remap_9x9[i],i] = 1
+    
 def mean_mse_loss(y_true, y_pred):
+    
     y_true = tf.matmul(K.reshape(y_true,(-1,81)),remap_9x9_matrix)
     y_pred = tf.matmul(K.reshape(y_pred,(-1,81)),remap_9x9_matrix)
     # Calculate the squared difference between predicted and target values
@@ -54,7 +57,6 @@ if not os.path.exists(model_dir):
 
 batch = args.batchsize
 
-#Specs
 n_kernels = 8
 n_encoded=16
 conv_weightBits  = 6 
@@ -64,28 +66,35 @@ dense_biasBits  = 6
 encodedBits = 9
 CNN_kernel_size = 3
 
+
 input_enc = Input(batch_shape=(batch,9,9, 1))
+# sum_input quantization is done in the dataloading step for simplicity
 sum_input = Input(batch_shape=(batch,1))
 eta = Input(batch_shape =(batch,1))
+
+# Quantizing input, 8 bit quantization, 1 bit for integer
+x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'input_quantization')(input_enc)
+
 x = QConv2D(n_kernels,
             CNN_kernel_size, 
-#             padding='same',
-            strides=2,
-            kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1),
-            bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
-            name="conv2d")(input_enc)
+            strides=2, kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
+            name="conv2d")(x)
+
 x = QActivation("quantized_relu(bits=8,integer=1)", name="act")(x)
+
 x = Flatten()(x)
 
-# x = Concatenate(axis=1)([x[:,:80],x[:,96:112]]) 
 x = QDense(n_encoded, 
            kernel_quantizer=quantized_bits(bits=dense_weightBits,integer=0,keep_negative=1,alpha=1),
            bias_quantizer=quantized_bits(bits=dense_biasBits,integer=0,keep_negative=1,alpha=1),
            name="dense")(x)
 
-x = concatenate([x,sum_input,eta],axis=1)
-latent = x
+# Quantizing latent space, 9 bit quantization, 1 bit for integer
+x = QActivation(qkeras.quantized_bits(bits = 9, integer = 1),name = 'latent_quantization')(x)
 
+x = concatenate([x,sum_input,eta],axis=1)
+
+latent = x
 
 input_dec = Input(batch_shape=(batch,18))
 y = Dense(24)(input_dec)
@@ -99,7 +108,6 @@ y = Conv2DTranspose(1, (3, 3), strides=(2, 2))(y)
 y = ReLU()(y)
 recon = y
 
-
 encoder = keras.Model([input_enc,sum_input,eta], latent, name="encoder")
 decoder = keras.Model([input_dec], recon, name="decoder")
 
@@ -109,13 +117,19 @@ cae = Model(
     name="cae"
 )
 
-
 if args.loss == 'mse':
     loss=mean_mse_loss
 elif args.loss == 'tele':
     loss = telescopeMSE9x9
-
-cae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate = args.lr,weight_decay = 0), loss=loss)
+print(args.optim)
+if args.optim == 'adam':
+    print('Using ADAM Optimizer')
+    opt = tf.keras.optimizers.Adam(learning_rate = args.lr,weight_decay = 0.000025)
+elif args.optim == 'lion':
+    print('Using Lion Optimizer')
+    opt = tf.keras.optimizers.Lion(learning_rate = args.lr,weight_decay = 0.00025)
+    
+cae.compile(optimizer=opt, loss=loss)
 cae.summary()
 
 def load_matching_state_dict(model, state_dict_path):
@@ -140,6 +154,7 @@ elif args.mpath:
 
 
 def load_data(nfiles,batchsize, normalize = True):
+    ecr = np.vectorize(encode)
     data_list = []
 
     for i in range(nfiles):
@@ -162,24 +177,44 @@ def load_data(nfiles,batchsize, normalize = True):
     # Extract specific tensors
     if normalize:
         train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
-        train_data = tf.boolean_mask(train_data,tf.squeeze(train_sum_calcq,axis=-1) != 0)
+        train_data = tf.boolean_mask(train_data,tf.squeeze(train_sum_calcq,axis=-1) != 0.0)
         train_sum_calcq = tf.boolean_mask(train_sum_calcq,tf.squeeze(train_sum_calcq,axis=-1) != 0)
         train_wafers = expand_tensor(train_data[:, 0:48]/train_sum_calcq)
     else:
         train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
         train_wafers = expand_tensor(train_data[:, 0:48])
-    train_eta = tf.expand_dims(train_data[:, -2], axis=1)
+    
 
     if normalize:
         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
-        test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0)
+        test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0.0)
         test_sum_calcq = tf.boolean_mask(test_sum_calcq,tf.squeeze(test_sum_calcq,axis=-1) != 0)
         test_wafers = expand_tensor(test_data[:, 0:48]/test_sum_calcq)
     else:
         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
         test_wafers = expand_tensor(test_data[:, 0:48])
+    
+    ''' 
+    
+    Quantize Sum CalcQ with 5 exp bits and 4 mant bits
+    
+    Taking the log here is effectivel taking the log on readout. It makes no change to the quantization,
+    just a convenient setup for keras.
+    
+    '''
+   
+    train_sum_calcq = train_sum_calcq.numpy().astype(int)
+    train_sum_calcq = ecr(train_sum_calcq, dropBits=0, expBits=5, mantBits=4, roundBits=False, asInt=True)
+    train_sum_calcq = tf.math.log(tf.constant(train_sum_calcq,dtype = tf.float64))
+   
+    
+    test_sum_calcq = test_sum_calcq.numpy().astype(int)
+    test_sum_calcq = ecr(test_sum_calcq, dropBits=0, expBits=5, mantBits=4, roundBits=False, asInt=True)
+    test_sum_calcq = tf.math.log(tf.constant(test_sum_calcq,dtype = tf.float64))
+    
+    train_eta = tf.expand_dims(train_data[:, -2], axis=1)
     test_eta = tf.expand_dims(test_data[:, -2], axis=1)
-
+    
     # Create data loaders for training and test data
     train_dataset = tf.data.Dataset.from_tensor_slices((train_wafers, train_sum_calcq, train_eta))
     train_loader = train_dataset.batch(batchsize).shuffle(buffer_size=train_size).prefetch(buffer_size=tf.data.AUTOTUNE)
@@ -188,6 +223,7 @@ def load_data(nfiles,batchsize, normalize = True):
     test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=test_size).prefetch(buffer_size=tf.data.AUTOTUNE)
 
     return train_loader, test_loader
+
 
 
 def expand_tensor(input_tensor):
@@ -209,7 +245,7 @@ def expand_tensor(input_tensor):
                         1,1,1,1,0,0,0,0,])
    
     inputdata = tf.reshape(tf.gather(input_tensor, arrange,axis =1), (input_tensor.shape[0],8, 8, 1))
-#     inputdata *= tf.cast(tf.reshape(arrMask, (1, 8, 8)), dtype=inputdata.dtype)
+
 
     paddings = [(0, 0), (0, 1), (0, 1), (0, 0)]
     padded_tensor = tf.pad(inputdata, paddings, mode='CONSTANT', constant_values=0)
@@ -234,20 +270,29 @@ if args.continue_training:
 else:
     start_epoch = 1
     loss_dict = {'train_loss': [], 'val_loss': []}
-    
-    
+  
+
+
 for epoch in range(start_epoch, args.nepochs):
+    if epoch == int(args.nepochs/3):
+        if args.pretrain_model:
+            print('Beginnning Fine Tuning')
+            if args.optim == 'adam':
+                opt = tf.keras.optimizers.Adam(learning_rate = args.lr/100,weight_decay = 0.000025)
+            elif args.optim == 'lion':
+                opt = tf.keras.optimizers.Lion(learning_rate = args.lr/100,weight_decay = 0.00025)
+            cae.compile(optimizer=opt, loss=telescopeMSE9x9)
+
     total_loss_train = 0
     
     for wafers, sum_calcq, eta in train_loader:
         
         if wafers.shape[0] != batch:
             break
-            
         loss = cae.train_on_batch([wafers, sum_calcq, eta], wafers)
-        total_loss_train =total_loss_train + loss
+        total_loss_train = total_loss_train + loss
+        
     total_loss_val = 0 
-    
     for wafers, sum_calcq, eta in test_loader:
 
         if wafers.shape[0] != batch:
