@@ -200,7 +200,7 @@ d = input_wafers-output_wafers
 sum_d = tf.reduce_sum(d,axis = 1)
 plt.figure()
 plt.title('Sum CalcQ proportion error')
-plt.hist(sum_d[0:10000],bins = 50)
+plt.hist(sum_d[0:100000],bins = 50)
 plt.savefig(model_dir+'/'+'SumCalcQProportionError')
 
 
@@ -228,15 +228,15 @@ lossTC3 = ((K.mean(K.square(y_true_3 - y_pred_3) * K.maximum(y_pred_3, y_true_3)
 
 plt.figure()
 plt.title('Loss TC1')
-plt.hist(lossTC1[0:10000],bins = 50)
+plt.hist(lossTC1[0:100000],bins = 50)
 plt.savefig(model_dir+'/'+'Loss_TC1_Hist')
     
 plt.figure()
 plt.title('Loss TC2')
-plt.hist(lossTC2[0:10000],bins = 50)
+plt.hist(lossTC2[0:100000],bins = 50)
 plt.savefig(model_dir+'/'+'Loss_TC2_Hist')
 
 plt.figure()
 plt.title('Loss TC3')
-plt.hist(lossTC3[0:10000],bins = 50)
+plt.hist(lossTC3[0:100000],bins = 50)
 plt.savefig(model_dir+'/'+'Loss_TC3_Hist')
