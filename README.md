@@ -1,5 +1,9 @@
 # ECON_QAE
-Weight training of the autoencoder in QKeras using a conditional autoencoder architecture for the future implementation of the HGCAL.
+Weight training of the autoencoder in QKeras using a conditional autoencoder architecture for the future implementation of the HGCAL. A conditional autoencoder is an optimal architecture for this limited-sized model for several reasons. 
+
+It is widely known that the normalization of data is extremely beneficial to the training of models. However, normalization here disregards the underlying physics and throws away key information for future physical analysis. We can solve this problem through normalization of the data, to allow for optimal training, while conditioning on the sum of the input during decoding, thus preserving key physical information. 
+
+Additionally, we have seen a strong eta dependence on readout characteristics. This stems from three different thicknesses for the silicon wafers which detect particles that are ordered based on eta. We can resolve this problem as well through conditioning on the known eta value of the silicon wafer during decoding. Thus we can effectively build the system geometry into our model.
 
 
 ## Encoder Architecture
