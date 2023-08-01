@@ -24,7 +24,19 @@ p.add_args(
     
 )
 
+remap_9x9 = [
+    4, 13, 22, 31, 5, 14, 23, 32, 6, 15, 24, 33, 7, 16, 25, 34,
+    27, 28, 29, 30, 18, 19, 20, 21, 9, 10, 11, 12, 0, 1, 2, 3,
+    66, 57, 48, 40, 65, 56, 50, 49, 64, 60, 59, 58, 70, 69, 68, 67
+]
+
+remap_9x9_matrix = np.zeros(48*81,dtype=np.float32).reshape((81,48))
+
+for i in range(48): 
+    remap_9x9_matrix[remap_9x9[i],i] = 1
 def mean_mse_loss(y_true, y_pred):
+    y_true = tf.matmul(K.reshape(y_true,(-1,81)),remap_9x9_matrix)
+    y_pred = tf.matmul(K.reshape(y_pred,(-1,81)),remap_9x9_matrix)
     # Calculate the squared difference between predicted and target values
     squared_diff = tf.square(y_pred - y_true)
 
@@ -33,7 +45,6 @@ def mean_mse_loss(y_true, y_pred):
 
     # Take the mean of the MSE values to get the overall MSE loss
     mean_mse_loss = tf.reduce_mean(mse_per_row)
-
     return mean_mse_loss
 
 args = p.parse_args()
@@ -77,7 +88,11 @@ latent = x
 
 
 input_dec = Input(batch_shape=(batch,18))
-y = Dense(128)(input_dec)
+y = Dense(24)(input_dec)
+y = ReLU()(y)
+y = Dense(64)(y)
+y = ReLU()(y)
+y = Dense(128)(y)
 y = ReLU()(y)
 y = Reshape((4, 4, 8))(y)
 y = Conv2DTranspose(1, (3, 3), strides=(2, 2))(y)
@@ -94,7 +109,13 @@ cae = Model(
     name="cae"
 )
 
-cae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate = 1e-5), loss=mean_mse_loss)
+
+if args.loss == 'mse':
+    loss=mean_mse_loss
+elif args.loss == 'tele':
+    loss = telescopeMSE9x9
+
+cae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate = args.lr,weight_decay = 0), loss=loss)
 cae.summary()
 
 def load_matching_state_dict(model, state_dict_path):
@@ -118,7 +139,7 @@ elif args.mpath:
     print('loaded model')
 
 
-def load_data(nfiles,batchsize):
+def load_data(nfiles,batchsize, normalize = True):
     data_list = []
 
     for i in range(nfiles):
@@ -131,7 +152,7 @@ def load_data(nfiles,batchsize):
         data_list.append(dt)
 
     data_tensor = tf.convert_to_tensor(np.concatenate(data_list), dtype=tf.float32)
-
+    data_tensor = data_tensor[0:500000]
     train_size = int(0.8 * len(data_tensor))
     test_size = len(data_tensor) - train_size
 
@@ -139,12 +160,24 @@ def load_data(nfiles,batchsize):
     train_data, test_data = tf.split(data_tensor, [train_size, test_size], axis=0)
 
     # Extract specific tensors
-    train_wafers = expand_tensor(train_data[:, 0:48])
-    train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
+    if normalize:
+        train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
+        train_data = tf.boolean_mask(train_data,tf.squeeze(train_sum_calcq,axis=-1) != 0)
+        train_sum_calcq = tf.boolean_mask(train_sum_calcq,tf.squeeze(train_sum_calcq,axis=-1) != 0)
+        train_wafers = expand_tensor(train_data[:, 0:48]/train_sum_calcq)
+    else:
+        train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
+        train_wafers = expand_tensor(train_data[:, 0:48])
     train_eta = tf.expand_dims(train_data[:, -2], axis=1)
 
-    test_wafers = expand_tensor(test_data[:, 0:48])
-    test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
+    if normalize:
+        test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
+        test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0)
+        test_sum_calcq = tf.boolean_mask(test_sum_calcq,tf.squeeze(test_sum_calcq,axis=-1) != 0)
+        test_wafers = expand_tensor(test_data[:, 0:48]/test_sum_calcq)
+    else:
+        test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
+        test_wafers = expand_tensor(test_data[:, 0:48])
     test_eta = tf.expand_dims(test_data[:, -2], axis=1)
 
     # Create data loaders for training and test data
@@ -155,6 +188,8 @@ def load_data(nfiles,batchsize):
     test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=test_size).prefetch(buffer_size=tf.data.AUTOTUNE)
 
     return train_loader, test_loader
+
+
 def expand_tensor(input_tensor):
     arrange = np.array([28,29,30,31,0,4,8,12,
                          24,25,26,27,1,5,9,13,
@@ -204,13 +239,13 @@ else:
 for epoch in range(start_epoch, args.nepochs):
     total_loss_train = 0
     
-    for wafers, sum_calcq, eta in test_loader:
+    for wafers, sum_calcq, eta in train_loader:
         
         if wafers.shape[0] != batch:
             break
             
         loss = cae.train_on_batch([wafers, sum_calcq, eta], wafers)
-        total_loss_train += loss
+        total_loss_train =total_loss_train + loss
     total_loss_val = 0 
     
     for wafers, sum_calcq, eta in test_loader:
@@ -219,12 +254,12 @@ for epoch in range(start_epoch, args.nepochs):
             break
             
         loss = cae.test_on_batch([wafers, sum_calcq, eta], wafers)
-        total_loss_val += loss
+        
+        total_loss_val = total_loss_val+loss
         
         
     total_loss_train = total_loss_train/(len(train_loader)*batch)
     total_loss_val = total_loss_val/(len(test_loader)*batch)
-    
     print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
         epoch, total_loss_train,  total_loss_val))
 
