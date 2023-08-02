@@ -66,7 +66,6 @@ dense_biasBits  = 6
 encodedBits = 9
 CNN_kernel_size = 3
 
-
 input_enc = Input(batch_shape=(batch,9,9, 1))
 # sum_input quantization is done in the dataloading step for simplicity
 sum_input = Input(batch_shape=(batch,1))

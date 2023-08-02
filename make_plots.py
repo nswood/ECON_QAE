@@ -2,20 +2,22 @@
 This script will generate a folder 'opath'_plots with several plots to evaluate the performance of the autoencoder
 
 '''
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
+import matplotlib.pyplot as plt
 from tensorflow.keras import layers
-from qkeras import *
+from qkeras import QActivation,QConv2D,QDense,quantized_bits
+import qkeras
 from keras.models import Model
 from keras.layers import *
 from telescope import *
+from utils import *
 import os
 import sys
-import utils
-p = utils.ArgumentParser()
+
+p = ArgumentParser()
 p.add_args(
     ('--opath', p.STR) 
 )
@@ -51,6 +53,7 @@ if not os.path.exists(model_dir):
 
     
 #Specs
+
 n_kernels = 8
 n_encoded=16
 conv_weightBits  = 6 
@@ -61,27 +64,33 @@ encodedBits = 9
 CNN_kernel_size = 3
 
 input_enc = Input(batch_shape=(batch,9,9, 1))
+# sum_input quantization is done in the dataloading step for simplicity
 sum_input = Input(batch_shape=(batch,1))
 eta = Input(batch_shape =(batch,1))
+
+# Quantizing input, 8 bit quantization, 1 bit for integer
+x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'input_quantization')(input_enc)
+
 x = QConv2D(n_kernels,
             CNN_kernel_size, 
-#             padding='same',
-            strides=2,
-            kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1),
-            bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
-            name="conv2d")(input_enc)
+            strides=2, kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
+            name="conv2d")(x)
+
 x = QActivation("quantized_relu(bits=8,integer=1)", name="act")(x)
+
 x = Flatten()(x)
 
-# x = Concatenate(axis=1)([x[:,:80],x[:,96:112]]) 
 x = QDense(n_encoded, 
            kernel_quantizer=quantized_bits(bits=dense_weightBits,integer=0,keep_negative=1,alpha=1),
            bias_quantizer=quantized_bits(bits=dense_biasBits,integer=0,keep_negative=1,alpha=1),
            name="dense")(x)
 
-x = concatenate([x,sum_input,eta],axis=1)
-latent = x
+# Quantizing latent space, 9 bit quantization, 1 bit for integer
+x = QActivation(qkeras.quantized_bits(bits = 9, integer = 1),name = 'latent_quantization')(x)
 
+x = concatenate([x,sum_input,eta],axis=1)
+
+latent = x
 
 input_dec = Input(batch_shape=(batch,18))
 y = Dense(24)(input_dec)
@@ -94,7 +103,6 @@ y = Reshape((4, 4, 8))(y)
 y = Conv2DTranspose(1, (3, 3), strides=(2, 2))(y)
 y = ReLU()(y)
 recon = y
-
 
 encoder = keras.Model([input_enc,sum_input,eta], latent, name="encoder")
 decoder = keras.Model([input_dec], recon, name="decoder")
@@ -112,6 +120,7 @@ cae.load_weights(latest)
 cae.compile()
 
 def load_data(nfiles,batchsize, normalize = True):
+    ecr = np.vectorize(encode)
     data_list = []
 
     for i in range(nfiles):
@@ -131,16 +140,50 @@ def load_data(nfiles,batchsize, normalize = True):
     # Split the data into training and test sets
     train_data, test_data = tf.split(data_tensor, [train_size, test_size], axis=0)
 
+    # Extract specific tensors
+    if normalize:
+        train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
+        train_data = tf.boolean_mask(train_data,tf.squeeze(train_sum_calcq,axis=-1) != 0.0)
+        train_sum_calcq = tf.boolean_mask(train_sum_calcq,tf.squeeze(train_sum_calcq,axis=-1) != 0)
+        train_wafers = expand_tensor(train_data[:, 0:48]/train_sum_calcq)
+    else:
+        train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
+        train_wafers = expand_tensor(train_data[:, 0:48])
+    
+
     if normalize:
         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
-        test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0)
+        test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0.0)
         test_sum_calcq = tf.boolean_mask(test_sum_calcq,tf.squeeze(test_sum_calcq,axis=-1) != 0)
         test_wafers = expand_tensor(test_data[:, 0:48]/test_sum_calcq)
     else:
         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
         test_wafers = expand_tensor(test_data[:, 0:48])
+    
+    ''' 
+    
+    Quantize Sum CalcQ with 5 exp bits and 4 mant bits
+    
+    Taking the log here is effectivel taking the log on readout. It makes no change to the quantization,
+    just a convenient setup for keras.
+    
+    '''
+   
+    train_sum_calcq = train_sum_calcq.numpy().astype(int)
+    train_sum_calcq = ecr(train_sum_calcq, dropBits=0, expBits=5, mantBits=4, roundBits=False, asInt=True)
+    train_sum_calcq = tf.math.log(tf.constant(train_sum_calcq,dtype = tf.float64))
+   
+    
+    test_sum_calcq = test_sum_calcq.numpy().astype(int)
+    test_sum_calcq = ecr(test_sum_calcq, dropBits=0, expBits=5, mantBits=4, roundBits=False, asInt=True)
+    test_sum_calcq = tf.math.log(tf.constant(test_sum_calcq,dtype = tf.float64))
+    
+    train_eta = tf.expand_dims(train_data[:, -2], axis=1)
     test_eta = tf.expand_dims(test_data[:, -2], axis=1)
-
+    
+    # Create data loaders for training and test data
+    train_dataset = tf.data.Dataset.from_tensor_slices((train_wafers, train_sum_calcq, train_eta))
+    train_loader = train_dataset.batch(batchsize).shuffle(buffer_size=train_size).prefetch(buffer_size=tf.data.AUTOTUNE)
 
     test_dataset = tf.data.Dataset.from_tensor_slices((test_wafers, test_sum_calcq, test_eta))
     test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=test_size).prefetch(buffer_size=tf.data.AUTOTUNE)
