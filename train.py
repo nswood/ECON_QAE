@@ -5,12 +5,24 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from qkeras import QActivation,QConv2D,QDense,quantized_bits
 import qkeras
+from qkeras.utils import model_save_quantized_weights
 from keras.models import Model
 from keras.layers import *
 from telescope import *
 from utils import *
+import inspect
+import json
 import os
 import sys
+import graph
+
+import pickle
+from tensorflow.keras.models import model_from_json
+from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+
+import matplotlib.pyplot as plt
+import mplhep as hep
+
 
 p = ArgumentParser()
 p.add_args(
@@ -79,7 +91,9 @@ x = QConv2D(n_kernels,
             strides=2, kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
             name="conv2d")(x)
 
-x = QActivation("quantized_relu(bits=8,integer=1)", name="act")(x)
+# x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'act')(x)
+
+# x = QActivation("quantized_relu(bits=8,integer=1)", name="act")(x)
 
 x = Flatten()(x)
 
@@ -130,6 +144,54 @@ elif args.optim == 'lion':
     
 cae.compile(optimizer=opt, loss=loss)
 cae.summary()
+
+def get_pams():
+    jsonpams={}      
+    opt_classes = tuple(opt[1] for opt in inspect.getmembers(tf.keras.optimizers,inspect.isclass))
+    for k,v in self.pams.items():
+        if type(v)==type(np.array([])):
+            jsonpams[k] = v.tolist()
+        elif  isinstance(v,opt_classes):
+            config = {}
+            for hp in v.get_config():
+                config[hp] = str(v.get_config()[hp])
+            jsonpams[k] = config
+        elif  type(v)==type(telescopeMSE9x9):
+            jsonpams[k] =str(v) 
+        else:
+            jsonpams[k] = v 
+    return jsonpams
+def save_models(autoencoder, name, isQK=False):
+    
+    #fix all this saving shit
+    
+
+    json_string = autoencoder.to_json()
+    encoder = autoencoder.get_layer("encoder")
+    decoder = autoencoder.get_layer("decoder")
+    f'./{model_dir}/{name}.json'
+    with open(f'./{model_dir}/{name}.json','w') as f:        f.write(autoencoder.to_json())
+    with open(f'./{model_dir}/encoder_{name}.json','w') as f:            f.write(encoder.to_json())
+    with open(f'./{model_dir}/decoder_{name}.json','w') as f:            f.write(decoder.to_json())
+
+    autoencoder.save_weights(f'./{model_dir}/{name}.hdf5')
+    encoder.save_weights(f'./{model_dir}/encoder_{name}.hdf5')
+    decoder.save_weights(f'./{model_dir}/decoder_{name}.hdf5')
+    if isQK:
+        encoder_qWeight = model_save_quantized_weights(encoder)
+        with open(f'{model_dir}/encoder_{name}.pkl','wb') as f:
+            pickle.dump(encoder_qWeight,f)
+        encoder = graph.set_quantized_weights(encoder,f'{model_dir}/encoder_'+name+'.pkl')
+    graph.write_frozen_graph_enc(encoder,'encoder_'+name+'.pb',logdir = model_dir)
+    graph.write_frozen_graph_enc(encoder,'encoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
+    graph.write_frozen_graph_dec(decoder,'decoder_'+name+'.pb',logdir = model_dir)
+    graph.write_frozen_graph_dec(decoder,'decoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
+
+    graph.plot_weights(autoencoder,outdir = model_dir)
+    graph.plot_weights(encoder,outdir = model_dir)
+    graph.plot_weights(decoder,outdir = model_dir)
+    
+
 
 def load_matching_state_dict(model, state_dict_path):
     state_dict = tf.compat.v1.train.load_checkpoint(state_dict_path)
@@ -319,5 +381,12 @@ for epoch in range(start_epoch, args.nepochs):
 
     cae.save_weights(os.path.join(model_dir, f'epoch-{epoch}.tf'))
     if total_loss_val < best_val_loss:
+        print('New Best Model')
         best_val_loss = total_loss_val
         cae.save_weights(os.path.join(model_dir, 'best-epoch.tf'.format(epoch)))
+        
+tf.saved_model.save(encoder, os.path.join(model_dir, 'best-encoder'))
+tf.saved_model.save(encoder, os.path.join(model_dir, 'best-decoder'))
+save_models(cae,args.mname,isQK = True)
+        
+        
