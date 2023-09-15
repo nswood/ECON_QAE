@@ -74,6 +74,25 @@ def write_frozen_graph_dec(model,outputName="frozen_graph.pb",logdir='./',asText
                       name=outputName,
                       as_text=asText)
 
+# Write model to graph
+def write_frozen_dummy_enc(model,outputName="frozen_graph.pb",logdir='./',asText=False):
+#     full_model = tf.function(lambda x,y,z: model(x,y,z))
+    @tf.function
+    def full_model(x):
+        return model([x])
+    
+    full_model = full_model.get_concrete_function(tf.TensorSpec(model.inputs[0].shape, model.inputs[0].dtype))
+
+    frozen_func = convert_variables_to_constants_v2(full_model)
+    frozen_func.graph.as_graph_def()
+
+    layers = [op.name for op in frozen_func.graph.get_operations()]
+
+    # Save frozen graph from frozen ConcreteFunction to hard drive
+    tf.io.write_graph(graph_or_graph_def=frozen_func.graph,
+                      logdir=logdir,
+                      name=outputName,
+                      as_text=asText)    
 ## Load frozen graph
 def load_frozen_graph(graph,printGraph=False):
     with tf.io.gfile.GFile(graph, "rb") as f:
