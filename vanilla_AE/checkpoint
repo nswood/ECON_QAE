@@ -1,0 +1,2 @@
+model_checkpoint_path: "epoch-99.tf"
+all_model_checkpoint_paths: "epoch-99.tf"
