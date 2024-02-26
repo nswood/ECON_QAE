@@ -28,29 +28,6 @@ node {
   }
 }
 node {
-  name: "y"
-  op: "Placeholder"
-  attr {
-    key: "dtype"
-    value {
-      type: DT_FLOAT
-    }
-  }
-  attr {
-    key: "shape"
-    value {
-      shape {
-        dim {
-          size: 1
-        }
-        dim {
-          size: 8
-        }
-      }
-    }
-  }
-}
-node {
   name: "encoder/latent_quantization/mul_3/x"
   op: "Const"
   attr {
@@ -1377,27 +1354,6 @@ node {
         tensor_shape {
         }
         float_val: 256.0
-      }
-    }
-  }
-}
-node {
-  name: "encoder/concatenate/concat/axis"
-  op: "Const"
-  attr {
-    key: "dtype"
-    value {
-      type: DT_INT32
-    }
-  }
-  attr {
-    key: "value"
-    value {
-      tensor {
-        dtype: DT_INT32
-        tensor_shape {
-        }
-        int_val: 1
       }
     }
   }
@@ -3463,34 +3419,9 @@ node {
   }
 }
 node {
-  name: "encoder/concatenate/concat"
-  op: "ConcatV2"
-  input: "encoder/latent_quantization/add_3"
-  input: "y"
-  input: "encoder/concatenate/concat/axis"
-  attr {
-    key: "N"
-    value {
-      i: 2
-    }
-  }
-  attr {
-    key: "T"
-    value {
-      type: DT_FLOAT
-    }
-  }
-  attr {
-    key: "Tidx"
-    value {
-      type: DT_INT32
-    }
-  }
-}
-node {
   name: "encoder/tf.math.multiply/Mul"
   op: "Mul"
-  input: "encoder/concatenate/concat"
+  input: "encoder/latent_quantization/add_3"
   input: "encoder/tf.math.multiply/Mul/y"
   attr {
     key: "T"
