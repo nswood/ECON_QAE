@@ -37,31 +37,26 @@ p.add_args(
     
 )
 
-# remap_9x9 = [
-#     4, 13, 22, 31, 5, 14, 23, 32, 6, 15, 24, 33, 7, 16, 25, 34,
-#     27, 28, 29, 30, 18, 19, 20, 21, 9, 10, 11, 12, 0, 1, 2, 3,
-#     66, 57, 48, 40, 65, 56, 50, 49, 64, 60, 59, 58, 70, 69, 68, 67
-# ]
-
-# remap_9x9_matrix = np.zeros(48*81,dtype=np.float32).reshape((81,48))
-
-# for i in range(48): 
-#     remap_9x9_matrix[remap_9x9[i],i] = 1
+    
 remap_8x8 = [ 4, 12, 20, 28,  5, 13, 21, 29,  6, 14, 22, 30,  7, 15, 23, 31, 
               24, 25, 26, 27, 16, 17, 18, 19,  8,  9, 10, 11,  0,  1,  2,  3, 
               59, 51, 43, 35, 58, 50, 42, 34, 57, 49, 41, 33, 56, 48, 40, 32]
 def mean_mse_loss(y_true, y_pred):
     
-    y_true = tf.matmul(K.reshape(y_true,(-1,81)),remap_8x8_matrix)
-    y_pred = tf.matmul(K.reshape(y_pred,(-1,81)),remap_8x8_matrix)
+    max_values = tf.reduce_max(y_true[:,], axis=1)
+    
+    y_true = tf.gather(K.reshape(y_true,(-1,64)),remap_8x8,axis=-1)
+    y_pred = tf.gather(K.reshape(y_pred,(-1,64)),remap_8x8,axis=-1)
     # Calculate the squared difference between predicted and target values
     squared_diff = tf.square(y_pred - y_true)
 
     # Calculate the MSE per row (reduce_mean along axis=1)
     mse_per_row = tf.reduce_mean(squared_diff, axis=1)
+    weighted_mse_per_row = mse_per_row * max_values
+    
 
     # Take the mean of the MSE values to get the overall MSE loss
-    mean_mse_loss = tf.reduce_mean(mse_per_row)
+    mean_mse_loss = tf.reduce_mean(weighted_mse_per_row)
     return mean_mse_loss
 
 args = p.parse_args()
@@ -79,18 +74,23 @@ dense_weightBits  = 6
 dense_biasBits  = 6 
 encodedBits = 9
 CNN_kernel_size = 3
+padding = tf.constant([[0,0],[0, 1], [0, 1], [0, 0]])
+
 
 input_enc = Input(batch_shape=(batch,8,8, 1))
 # sum_input quantization is done in the dataloading step for simplicity
-sum_input = Input(batch_shape=(batch,1))
-eta = Input(batch_shape =(batch,1))
+# sum_input = Input(batch_shape=(batch,1))
+# eta = Input(batch_shape =(batch,1))
+
 
 # Quantizing input, 8 bit quantization, 1 bit for integer
 x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'input_quantization')(input_enc)
-
+x = tf.pad(
+    x, padding, mode='CONSTANT', constant_values=0, name=None
+)
 x = QConv2D(n_kernels,
             CNN_kernel_size, 
-            strides=2,padding = 'same', kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
+            strides=2,padding = 'valid', kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
             name="conv2d")(x)
 
 x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'act')(x)
@@ -107,11 +107,11 @@ x = QDense(n_encoded,
 # Quantizing latent space, 9 bit quantization, 1 bit for integer
 x = QActivation(qkeras.quantized_bits(bits = 9, integer = 1),name = 'latent_quantization')(x)
 
-x = concatenate([x,sum_input,eta],axis=1)
+# x = concatenate([x,sum_input,eta],axis=1)
 
 latent = x
 
-input_dec = Input(batch_shape=(batch,18))
+input_dec = Input(batch_shape=(batch,16))
 y = Dense(24)(input_dec)
 y = ReLU()(y)
 y = Dense(64)(y)
@@ -119,16 +119,17 @@ y = ReLU()(y)
 y = Dense(128)(y)
 y = ReLU()(y)
 y = Reshape((4, 4, 8))(y)
-y = Conv2DTranspose(1, (3, 3), strides=(2, 2),padding = 'same')(y)
+y = Conv2DTranspose(1, (3, 3), strides=(2, 2),padding = 'valid')(y)
+y =y[:,0:8,0:8]
 y = ReLU()(y)
 recon = y
 
-encoder = keras.Model([input_enc,sum_input,eta], latent, name="encoder")
+encoder = keras.Model([input_enc], latent, name="encoder")
 decoder = keras.Model([input_dec], recon, name="decoder")
 
 cae = Model(
-    inputs=[input_enc,sum_input,eta],
-    outputs=decoder([encoder([input_enc,sum_input,eta])]),
+    inputs=[input_enc],
+    outputs=decoder([encoder([input_enc])]),
     name="cae"
 )
 
@@ -163,6 +164,24 @@ def get_pams():
         else:
             jsonpams[k] = v 
     return jsonpams
+def get_normalize(data,rescaleInputToMax=False, sumlog2=True):
+    maxes =[]
+    sums =[]
+    sums_log2=[]
+    for i in range(len(data)):
+        maxes.append(data[i].max())
+        sums.append(data[i].sum())
+        sums_log2.append( 2**(np.floor(np.log2(data[i].sum()))) )
+        if sumlog2:
+            data[i] = 1.*data[i]/(sums_log2[-1] if sums_log2[-1] else 1.)
+        elif rescaleInputToMax:
+            data[i] = 1.*data[i]/(data[i].max() if data[i].max() else 1.)
+        else:
+            data[i] = 1.*data[i]/(data[i].sum() if data[i].sum() else 1.)
+    if sumlog2:
+        return  data,np.array(maxes),np.array(sums_log2)
+    else:
+        return data,np.array(maxes),np.array(sums)
 def save_models(autoencoder, name, isQK=False):
     
     #fix all this saving shit
@@ -184,8 +203,8 @@ def save_models(autoencoder, name, isQK=False):
         with open(f'{model_dir}/encoder_{name}.pkl','wb') as f:
             pickle.dump(encoder_qWeight,f)
         encoder = graph.set_quantized_weights(encoder,f'{model_dir}/encoder_'+name+'.pkl')
-    graph.write_frozen_graph_enc(encoder,'encoder_'+name+'.pb',logdir = model_dir)
-    graph.write_frozen_graph_enc(encoder,'encoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
+    graph.write_frozen_dummy_enc(encoder,'encoder_'+name+'.pb',logdir = model_dir)
+    graph.write_frozen_dummy_enc(encoder,'encoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
     graph.write_frozen_graph_dec(decoder,'decoder_'+name+'.pb',logdir = model_dir)
     graph.write_frozen_graph_dec(decoder,'decoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
 
@@ -207,33 +226,40 @@ def load_matching_state_dict(model, state_dict_path):
 
 # Loading Model
 if args.continue_training:
-    checkpoint = tf.train.latest_checkpoint(args.mpath)
-    model.load_weights(checkpoint)
-    start_epoch = int(checkpoint.split("/")[-1].split("-")[-1]) + 1
+    
+    cae.load_weights(args.mpath)
+    start_epoch = int(args.mpath.split("/")[-1].split(".")[-2].split("-")[-1]) + 1
     print(f"Continuing training from epoch {start_epoch}...")
 elif args.mpath:
-    load_matching_state_dict(model, args.mpath)
+    cae.load_weights(args.mpath)
+#     load_matching_state_dict(cae, args.mpath)
     print('loaded model')
 
-def normalize(data,rescaleInputToMax=False, sumlog2=True):
-    maxes =[]
-    sums =[]
-    sums_log2=[]
-    for i in range(len(data)):
-        maxes.append( data[i].max() )
-        sums.append( data[i].sum() )
-        sums_log2.append( 2**(np.floor(np.log2(data[i].sum()))) )
-        if sumlog2:
-            data[i] = 1.*data[i]/(sums_log2[-1] if sums_log2[-1] else 1.)
-        elif rescaleInputToMax:
-            data[i] = 1.*data[i]/(data[i].max() if data[i].max() else 1.)
-        else:
-            data[i] = 1.*data[i]/(data[i].sum() if data[i].sum() else 1.)
-    if sumlog2:
-        return  data,np.array(maxes),np.array(sums_log2)
-    else:
-        return data,np.array(maxes),np.array(sums)
     
+
+'''
+
+//printf("msb(modSum_) = %u\n", msb(modSum_));
+shift = msb(modSum_) - bitsPerInput_ + 1;
+//printf("shift = %d\n", shift);
+
+for(unsigned u=0; u<cellUVSize_; u++){
+    for(unsigned v=0; v<cellUVSize_; v++){
+        size_t CALQ = CALQs_[u][v];
+        if(bitShiftNormalize_){
+            if(shift > 0){
+                CALQ = CALQ >> shift; //truncate
+            } else {
+                CALQ = CALQ << -shift;
+            }
+        } else {
+            CALQ = size_t(getInputNorm() * CALQ / double(modSum_));//round
+        }
+        inputs_[u][v] = CALQ;
+    }
+'''
+
+
 def load_data(nfiles,batchsize, normalize = True):
     ecr = np.vectorize(encode)
     data_list = []
@@ -248,19 +274,38 @@ def load_data(nfiles,batchsize, normalize = True):
         data_list.append(dt)
 
     data_tensor = tf.convert_to_tensor(np.concatenate(data_list), dtype=tf.float32)
-    data_tensor = data_tensor[0:500000]
-    train_size = int(0.8 * len(data_tensor))
+    data_tensor = data_tensor[0:int(300000)]
+    train_size = int(0.9 * len(data_tensor))
     test_size = len(data_tensor) - train_size
 
     # Split the data into training and test sets
     train_data, test_data = tf.split(data_tensor, [train_size, test_size], axis=0)
 
     # Extract specific tensors
+#     if normalize:
+#         train_sum_calcq = tf.expand_dims(tf.sqrt(tf.reduce_sum(train_data[:, 0:48]**2, axis=1)), axis=1)
+#         train_data = tf.boolean_mask(train_data,tf.squeeze(train_sum_calcq,axis=-1) != 0.0)
+#         train_sum_calcq = tf.boolean_mask(train_sum_calcq,tf.squeeze(train_sum_calcq,axis=-1) != 0)
+#         train_wafers = expand_tensor(train_data[:, 0:48]/train_sum_calcq)
+#     else:
+#         train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
+#         train_wafers = expand_tensor(train_data[:, 0:48])
+    
+
+#     if normalize:
+#         test_sum_calcq = tf.expand_dims(tf.sqrt(tf.reduce_sum(test_data[:, 0:48]**2, axis=1)), axis=1)
+#         test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0.0)
+#         test_sum_calcq = tf.boolean_mask(test_sum_calcq,tf.squeeze(test_sum_calcq,axis=-1) != 0)
+#         test_wafers = expand_tensor(test_data[:, 0:48]/test_sum_calcq)
+#     else:
+#         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
+#         test_wafers = expand_tensor(test_data[:, 0:48])
     if normalize:
         train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
         train_data = tf.boolean_mask(train_data,tf.squeeze(train_sum_calcq,axis=-1) != 0.0)
         train_sum_calcq = tf.boolean_mask(train_sum_calcq,tf.squeeze(train_sum_calcq,axis=-1) != 0)
-        train_wafers = normalize(train_data[:, 0:48])[0]
+        train_wafers = get_normalize(train_data[:, 0:48].numpy())[0]
+        train_wafers = expand_tensor(tf.convert_to_tensor(train_wafers, dtype=tf.float32))
     else:
         train_sum_calcq = tf.expand_dims(tf.reduce_sum(train_data[:, 0:48], axis=1), axis=1)
         train_wafers = expand_tensor(train_data[:, 0:48])
@@ -270,7 +315,9 @@ def load_data(nfiles,batchsize, normalize = True):
         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
         test_data = tf.boolean_mask(test_data,tf.squeeze(test_sum_calcq,axis=-1) != 0.0)
         test_sum_calcq = tf.boolean_mask(test_sum_calcq,tf.squeeze(test_sum_calcq,axis=-1) != 0)
-        test_wafers = normalize(test_data[:, 0:48])[0]
+        test_wafers = get_normalize(test_data[:, 0:48].numpy())[0]
+        test_wafers = expand_tensor(tf.convert_to_tensor(test_wafers, dtype=tf.float32))
+        
     else:
         test_sum_calcq = tf.expand_dims(tf.reduce_sum(test_data[:, 0:48], axis=1), axis=1)
         test_wafers = expand_tensor(test_data[:, 0:48])
@@ -332,11 +379,11 @@ def expand_tensor(input_tensor):
 #     padded_tensor = tf.pad(inputdata, paddings, mode='CONSTANT', constant_values=0)
 
 #     return padded_tensor
-    return padded_tensor
-
+    return inputdata
 
 print('Loading Data')
-train_loader, test_loader = load_data(args.num_files,batch)
+if args.batchsize != 1:
+    train_loader, test_loader = load_data(args.num_files,batch)
 print('Data Loaded')
 
 
@@ -357,37 +404,42 @@ else:
 
 
 for epoch in range(start_epoch, args.nepochs):
-    if epoch == int(args.nepochs/3):
+    if epoch == 20:
         if args.pretrain_model:
             print('Beginnning Fine Tuning')
             if args.optim == 'adam':
-                opt = tf.keras.optimizers.Adam(learning_rate = args.lr/100,weight_decay = 0.000025)
+                opt = tf.keras.optimizers.Adam(learning_rate = args.lr,weight_decay = 0.000025)
             elif args.optim == 'lion':
-                opt = tf.keras.optimizers.Lion(learning_rate = args.lr/100,weight_decay = 0.00025)
+                opt = tf.keras.optimizers.Lion(learning_rate = args.lr,weight_decay = 0.00025)
             cae.compile(optimizer=opt, loss=telescopeMSE8x8)
-
+            
+            cae.load_weights(model_dir+'/best-epoch.tf')
+            print('Loaded Best Pretrained Model')
+            
+            
+    
     total_loss_train = 0
     
     for wafers, sum_calcq, eta in train_loader:
         
-        if wafers.shape[0] != batch:
-            break
-        loss = cae.train_on_batch([wafers, sum_calcq, eta], wafers)
+#         if wafers.shape[0] != batch:
+#             break
+        loss = cae.train_on_batch([wafers], wafers)
         total_loss_train = total_loss_train + loss
         
     total_loss_val = 0 
     for wafers, sum_calcq, eta in test_loader:
 
-        if wafers.shape[0] != batch:
-            break
+#         if wafers.shape[0] != batch:
+#             break
             
-        loss = cae.test_on_batch([wafers, sum_calcq, eta], wafers)
+        loss = cae.test_on_batch([wafers], wafers)
         
         total_loss_val = total_loss_val+loss
         
         
-    total_loss_train = total_loss_train/(len(train_loader)*batch)
-    total_loss_val = total_loss_val/(len(test_loader)*batch)
+    total_loss_train = total_loss_train/(len(train_loader))
+    total_loss_val = total_loss_val/(len(test_loader))
     print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
         epoch, total_loss_train,  total_loss_val))
 
@@ -407,45 +459,7 @@ for epoch in range(start_epoch, args.nepochs):
         best_val_loss = total_loss_val
         cae.save_weights(os.path.join(model_dir, 'best-epoch.tf'.format(epoch)))
         
-tf.saved_model.save(encoder, os.path.join(model_dir, 'best-encoder'))
-tf.saved_model.save(encoder, os.path.join(model_dir, 'best-decoder'))
+# tf.saved_model.save(encoder, os.path.join(model_dir, 'best-encoder'))
+# tf.saved_model.save(decoder, os.path.join(model_dir, 'best-decoder'))
 save_models(cae,args.mname,isQK = True)
 
-
-# #Tring to avoid parsing the json by converting here
-# def save_graph(tfsession,pred_node_names,tfoutpath,graphname):
-#     saver = tfv1.train.Saver()
-    
-#     from tensorflow.python.framework import graph_util
-#     from tensorflow.python.framework import graph_io
-
-#     constant_graph = graph_util.convert_variables_to_constants(
-#         tfsession, tfsession.graph.as_graph_def(), pred_node_names)
-#     #constant_graph = tfsession.graph.as_graph_def()
-
-#     f = graphname+'_constantgraph.pb.ascii'
-#     tfv1.train.write_graph(constant_graph, tfoutpath, f, as_text=True)
-#     print('saved the graph definition in ascii format at: ', os.path.join(tfoutpath, f))
-
-#     f = graphname+'_constantgraph.pb'
-#     tfv1.train.write_graph(constant_graph, tfoutpath, f, as_text=False)
-#     print('saved the graph definition in pb format at: ', os.path.join(tfoutpath, f))
-
-
-#     #graph_io.write_graph(constant_graph, args.outputDir, output_graph_name, as_text=False)
-#     #print('saved the constant graph (ready for inference) at: ', os.path.join(args.outputDir, output_graph_name))
-
-#     saver.save(tfsession, tfoutpath)
-# from tensorflow.python.framework import graph_util
-# from tensorflow.python.framework import graph_io
-
-# if tf.__version__.startswith("2."):
-#     tfv1 = tf.compat.v1
-# tfv1.disable_eager_execution()
-
-# tfsession = tfv1.keras.backend.get_session()
-
-# graph_node_names = ['encoded_vector/Relu']
-
-# save_graph(tfsession,graph_node_names,model_dir,'encoder')
-        

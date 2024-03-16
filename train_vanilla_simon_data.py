@@ -31,7 +31,7 @@ p.add_args(
     ('--opath', p.STR),
     ('--mpath', p.STR),('--prepath', p.STR),('--continue_training', p.STORE_TRUE), ('--batchsize', p.INT),
     ('--lr', {'type': float}),
-    ('--num_files', p.INT),('--pretrain_model', p.STORE_TRUE),('--optim', p.STR),('--eLinks', p.INT)
+    ('--num_files', p.INT),('--pretrain_model', p.STORE_TRUE),('--optim', p.STR),('--eLinks', p.INT),('--emd_pth', p.STR),('--sim_e_cut', p.STORE_TRUE),('--e_cut', p.STORE_TRUE),('--biased', p.STORE_TRUE),('--b_percent', {'type': float})
     
     
     
@@ -116,6 +116,21 @@ def mean_mse_loss(y_true, y_pred):
     # Take the mean of the MSE values to get the overall MSE loss
     mean_mse_loss = tf.reduce_mean(weighted_mse_per_row)
     return mean_mse_loss
+
+def get_emd_loss(mpath):
+    
+    
+    emd_model = tf.keras.models.load_model(mpath)
+    emd_model.trainable = False
+                 
+    
+  
+    def emd_loss(y_true, y_pred):
+        return tf.math.abs(emd_model([y_true, y_pred]))
+  
+    return emd_loss
+
+
 def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     from files import get_rootfiles
     from coffea.nanoevents import NanoEventsFactory
@@ -148,10 +163,44 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
                  2 : (layers<7) | (layers>13),
                  -1 : (layers>0)}
         inputs = inputs[select_eLinks[eLinks]]
+        
+        if args.sim_e_cut:
+            wafer_sim_energy = ak.to_numpy(ak.flatten(x.wafer.simenergy))
+            mask = (wafer_sim_energy[select_eLinks[eLinks]] > 0) 
+            inputs = inputs[mask]
+            
+
+        elif args.e_cut:
+            wafer_energy = ak.to_numpy(ak.flatten(x.wafer.energy))
+            mask =  (wafer_energy[select_eLinks[eLinks]] > 10)
+            
+            inputs = inputs[mask]
+
+        elif args.biased:
+            wafer_sim_energy = ak.to_numpy(ak.flatten(x.wafer.simenergy))[select_eLinks[eLinks]]
+            mask = (wafer_sim_energy > 0) 
+            indices_passing = np.where(mask)[0]
+            indices_not_passing = np.where(~mask)[0]
+            print(len(indices_passing) )
+            if args.b_percent is not None:
+                k = args.b_percent /(1-args.b_percent)
+            else: 
+                k = 3
+            desired_not_passing_count = int(len(indices_passing) / k) 
+            print(desired_not_passing_count)
+            selected_not_passing_indices = np.random.choice(indices_not_passing, size=desired_not_passing_count, replace=False)
+
+            new_mask_indices = np.concatenate((indices_passing, selected_not_passing_indices))
+            mask = np.zeros_like(wafer_sim_energy, dtype=bool)
+            mask[new_mask_indices] = True
+            inputs = inputs[mask]
+            
+           
         data_list.append(inputs)
 
     data_tensor = tf.convert_to_tensor(np.concatenate(data_list), dtype=tf.float32)
-    data_tensor = data_tensor[0:int(300000)]
+    data_tensor = data_tensor[0:int(1000000)]
+    print(len(data_tensor))
     train_size = int(0.9 * len(data_tensor))
     test_size = len(data_tensor) - train_size
 
@@ -168,6 +217,10 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=test_size).prefetch(buffer_size=tf.data.AUTOTUNE)
 
     return train_loader, test_loader
+
+
+
+
 args = p.parse_args()
 model_dir = args.opath
 if not os.path.exists(model_dir):
@@ -249,6 +302,10 @@ for eLinks in [2,3,4,5]:
     y = ReLU()(y)
     y = Dense(64)(y)
     y = ReLU()(y)
+#     y = Dense(64)(y)
+#     y = ReLU()(y)
+#     y = Dense(64)(y)
+#     y = ReLU()(y)
     y = Dense(128)(y)
     y = ReLU()(y)
     y = Reshape((4, 4, 8))(y)
@@ -270,6 +327,9 @@ for eLinks in [2,3,4,5]:
         loss=mean_mse_loss
     elif args.loss == 'tele':
         loss = telescopeMSE8x8
+    elif args.loss == 'emd':
+        loss = get_emd_loss(args.emd_pth)
+
     print(args.optim)
     if args.optim == 'adam':
         print('Using ADAM Optimizer')
@@ -364,11 +424,24 @@ for eLinks in [2,3,4,5]:
         loss_dict['val_loss'].append(total_loss_val)
 
         df = pd.DataFrame.from_dict(loss_dict)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(df['train_loss'], label='Training Loss')
+        plt.plot(df['val_loss'], label='Validation Loss')
+        plt.title('Training and Validation Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+
+        # Saving the plot in the same directory as the loss CSV
+        plot_path = f"{model_dir}/loss_plot.png"
+        plt.savefig(plot_path)
 
 
         df.to_csv("%s/" % model_dir + "/loss.csv")
 
-        cae.save_weights(os.path.join(model_dir, f'epoch-{epoch}.tf'))
+#         cae.save_weights(os.path.join(model_dir, f'epoch-{epoch}.tf'))
         if total_loss_val < best_val_loss:
             print('New Best Model')
             best_val_loss = total_loss_val
