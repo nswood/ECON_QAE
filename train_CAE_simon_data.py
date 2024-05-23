@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from keras import layers
+from keras.layers import Layer
 from qkeras import QActivation,QConv2D,QDense,quantized_bits
 import qkeras
 from qkeras.utils import model_save_quantized_weights
@@ -75,7 +76,7 @@ p.add_args(
     ('--opath', p.STR),
     ('--mpath', p.STR),('--prepath', p.STR),('--continue_training', p.STORE_TRUE), ('--batchsize', p.INT),
     ('--lr', {'type': float}),
-    ('--num_files', p.INT),('--pretrain_model', p.STORE_TRUE),('--optim', p.STR),('--eLinks', p.INT),('--emd_pth', p.STR),('--sim_e_cut', p.STORE_TRUE),('--e_cut', p.STORE_TRUE),('--biased', p.STORE_TRUE),('--b_percent', {'type': float}),('--flat_eta', p.STORE_TRUE),('--flat_sum_CALQ', p.STORE_TRUE)
+    ('--num_files', p.INT),('--optim', p.STR),('--eLinks', p.INT),('--emd_pth', p.STR),('--sim_e_cut', p.STORE_TRUE),('--e_cut', p.STORE_TRUE),('--biased', p.STORE_TRUE),('--b_percent', {'type': float}),('--flat_eta', p.STORE_TRUE),('--flat_sum_CALQ', p.STORE_TRUE)
     
     
     
@@ -85,6 +86,14 @@ p.add_args(
 remap_8x8 = [ 4, 12, 20, 28,  5, 13, 21, 29,  6, 14, 22, 30,  7, 15, 23, 31, 
               24, 25, 26, 27, 16, 17, 18, 19,  8,  9, 10, 11,  0,  1,  2,  3, 
               59, 51, 43, 35, 58, 50, 42, 34, 57, 49, 41, 33, 56, 48, 40, 32]
+
+with open('eLink_filts.pkl', 'rb') as f:
+    key_df = pickle.load(f)
+
+    
+
+
+    
 def get_pams():
     jsonpams={}      
     opt_classes = tuple(opt[1] for opt in inspect.getmembers(tf.keras.optimizers,inspect.isclass))
@@ -140,6 +149,8 @@ def load_matching_state_dict(model, state_dict_path):
         if var_name in state_dict:
             filtered_state_dict[var_name] = state_dict[var_name]
     tf.compat.v1.train.init_from_checkpoint(state_dict_path, filtered_state_dict)
+    
+    
 def mean_mse_loss(y_true, y_pred):
     
     max_values = tf.reduce_max(y_true[:,], axis=1)
@@ -153,294 +164,257 @@ def mean_mse_loss(y_true, y_pred):
     mse_per_row = tf.reduce_mean(squared_diff, axis=1)
     weighted_mse_per_row = mse_per_row * max_values
     
-
     # Take the mean of the MSE values to get the overall MSE loss
     mean_mse_loss = tf.reduce_mean(weighted_mse_per_row)
     return mean_mse_loss
 
-
-def get_emd_loss(mpath):
-    
-    
-    emd_model = tf.keras.models.load_model(mpath)
-    emd_model.trainable = False
-                 
-    
-  
-    def emd_loss(y_true, y_pred):
-        return tf.math.abs(emd_model([y_true, y_pred]))
-  
-    return emd_loss
-
-
-def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
-    if args.biased:
-        import numpy as np
-        train_dataset = tf.data.Dataset.load(f'biased_90_data/{eLinks}_eLinks_train')
-        all_dt = list(train_dataset)
-        wafers = []
-        c = []
-        for a,b in all_dt:
-            wafers.append(a)
-            c.append(b)
-        # Mask for just low eta data   
-        wafers = np.array(wafers)
-        c = np.array(c)
-        mask = np.abs(c[:,0]) < 2.5/3.1
-        wafers = wafers[mask]
-        c = c[mask]
-        wafers = np.array(wafers)
-        c = np.array(c)
-        train_size = len(c)
-        print(train_size)
-        train_dataset = tf.data.Dataset.from_tensor_slices((wafers, c)).take(train_size)
-        
-        
-        test_dataset = tf.data.Dataset.load(f'biased_90_data/{eLinks}_eLinks_test')
-        all_dt = list(test_dataset)
-        wafers = []
-        c = []
-        for a,b in all_dt:
-            wafers.append(a)
-            c.append(b)
-        # Mask for just low eta data    
-        wafers = np.array(wafers)
-        c = np.array(c)
-        mask = np.abs(c[:,0]) < 2.5/3.1
-        wafers = wafers[mask]
-        c = c[mask]
-        wafers = np.array(wafers)
-        c = np.array(c)
-        test_size = len(c)
-        print(test_size)
-        test_dataset = tf.data.Dataset.from_tensor_slices((wafers, c)).take(test_size)
-        
-        
-        if args.flat_eta:
-            train_dataset = filter_for_flat_distribution(train_dataset,0)
-
-            test_dataset = filter_for_flat_distribution(test_dataset,0)
-            
-        elif args.flat_sum_CALQ:
-            train_dataset = filter_for_flat_distribution(train_dataset,-2)
-
-            test_dataset = filter_for_flat_distribution(test_dataset,-2)
-        
-        train_loader = train_dataset.batch(batchsize).shuffle(buffer_size=train_size).prefetch(buffer_size=tf.data.AUTOTUNE)
-
-        test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=test_size).prefetch(buffer_size=tf.data.AUTOTUNE)
-
-        
-
-        return train_loader, test_loader
+def resample_indices(indices, energy, bin_edges, target_count, bin_index):
+    bin_indices = indices[(energy > bin_edges[bin_index]) & (energy <= bin_edges[bin_index+1])]
+    if len(bin_indices) > target_count:
+        return np.random.choice(bin_indices, size=target_count, replace=False)
     else:
-        from files import get_rootfiles
-        from coffea.nanoevents import NanoEventsFactory
-        import awkward as ak
-        import numpy as np
-        ecr = np.vectorize(encode)
-        data_list = []
+        return np.random.choice(bin_indices, size=target_count, replace=True)
+
+from imblearn.over_sampling import RandomOverSampler
+from imblearn.under_sampling import RandomUnderSampler
+from collections import Counter
+def custom_resample(wafers,c):
+    
+    label = (c[:,-1] != 0).astype(int)
+    n = len(label)
+    print(Counter(label))
+    indices = np.expand_dims(np.arange(n),axis = -1)
+    over = RandomOverSampler(sampling_strategy=0.1)
+    # fit and apply the transform
+    indices_p, label_p = over.fit_resample(indices, label)
+    # summarize class distribution
+    # define undersampling strategy
+    under = RandomUnderSampler(sampling_strategy=0.5)
+    # fit and apply the transform
+    indices_p, label_p = under.fit_resample(indices_p, label_p)
+    print(Counter(label_p))
+    wafers_p = wafers[indices_p[:,0]]
+    c_p = c[indices_p[:,0]]
+    
+    return wafers_p, c_p
+    
+def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
+    from files import get_rootfiles
+    from coffea.nanoevents import NanoEventsFactory
+    import awkward as ak
+    import numpy as np
+    ecr = np.vectorize(encode)
+    data_list = []
+
+    # Paths to Simon's dataset
+    hostid = 'cmseos.fnal.gov'
+    basepath = '/store/group/lpcpfnano/srothman/Nov08_2023_ECON_trainingdata'
+    tree = 'FloatingpointThreshold0DummyHistomaxDummynTuple/HGCalTriggerNtuple'
+
+    files = get_rootfiles(hostid, basepath)[0:nfiles]
 
 
-        hostid = 'cmseos.fnal.gov'
-        basepath = '/store/group/lpcpfnano/srothman/Nov08_2023_ECON_trainingdata'
-        tree = 'FloatingpointThreshold0DummyHistomaxDummynTuple/HGCalTriggerNtuple'
+    #loop over all the files
+    for i,file in enumerate(files):
+        x = NanoEventsFactory.from_root(file, treepath=tree).events()
 
-        files = get_rootfiles(hostid, basepath)[0:nfiles]
+        min_pt = 0  # replace with your minimum value
+        max_pt = 10e10  # replace with your maximum value
+        gen_pt = ak.to_pandas(x.gen.pt).groupby(level=0).mean()
+        mask = (gen_pt['values'] >= min_pt) & (gen_pt['values'] <= max_pt)
+        
+        
+        layer = ak.to_pandas(x.wafer.layer)
+        eta = ak.to_pandas(x.wafer.eta)
+        v = ak.to_pandas(x.wafer.waferv)
+        u = ak.to_pandas(x.wafer.waferu)
+        wafertype = ak.to_pandas(x.wafer.wafertype)
+        sumCALQ = ak.to_pandas(x.wafer['CALQ0'])
+        wafer_sim_energy = ak.to_pandas(x.wafer.simenergy)
+        wafer_energy = ak.to_pandas(x.wafer.energy)
+        
+        # Combine all DataFrames into a single DataFrame
+        data_dict = {
+            'eta': eta.values.flatten(),
+            'v': v.values.flatten(),
+            'u': u.values.flatten(),
+            'wafertype': wafertype.values.flatten(),
+            'sumCALQ': sumCALQ.values.flatten(),
+            'wafer_sim_energy': wafer_sim_energy.values.flatten(),
+            'wafer_energy': wafer_energy.values.flatten(),
+            'layer': layer.values.flatten()
+        }
 
+        # Add additional features AEin1 to AEin63 to the data dictionary
+        key = 'AEin0'
+        data_dict[key] = ak.to_pandas(x.wafer[key]).values.flatten()
+        for i in range(1, 64):
+            key = f'AEin{i}'
+            data_dict[key] = ak.to_pandas(x.wafer[key]).values.flatten()
+            key = f'CALQ{int(i)}'
+            data_dict[key] = ak.to_pandas(x.wafer[key]).values.flatten()
+            
 
-        #loop over all the files
-        for i,file in enumerate(files):
-            x = NanoEventsFactory.from_root(file, treepath=tree).events()
+        # Combine all data into a single DataFrame
+        combined_df = pd.DataFrame(data_dict, index=eta.index)
+        filtered_df = combined_df
+        
+#         print('Size before pt filtering')
+#         print(len(combined_df))
+        
+#         # Filter the combined DataFrame using the mask filter
+#         filtered_df = combined_df.loc[combined_df.index.get_level_values('entry').isin(mask)]
+        
+        print('Size after pt filtering')
+        print(len(filtered_df))
+        # Make eLink filter
+        filtered_key_df = key_df[key_df['trigLinks'] == float(eLinks)]
 
-            min_pt = 10  # replace with your minimum value
-            max_pt = 1000  # replace with your maximum value
-            gen_pt = ak.to_pandas(x.gen.pt).groupby(level=0).mean()
-            mask = (gen_pt['values'] >= min_pt) & (gen_pt['values'] <= max_pt)
-            layers = ak.to_pandas(x.wafer.layer)
-            layers = layers.loc[layers.index.get_level_values('entry').isin(mask)]
+        # Filter based on eLink allocations
+        filtered_df = pd.merge(filtered_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
+        
+        print('Size after eLink filtering')
+        print(len(filtered_df))
+              
+       
 
-            eta = ak.to_pandas(x.wafer.eta)
-            eta = eta.loc[eta.index.get_level_values('entry').isin(mask)]
+        # Process the filtered DataFrame
+        filtered_df['eta'] = filtered_df['eta'] / 3.1
+        filtered_df['v'] = filtered_df['v'] / 12
+        filtered_df['u'] = filtered_df['u'] / 12
 
-            waferv = ak.to_pandas(x.wafer.waferv)
-            waferv = waferv.loc[waferv.index.get_level_values('entry').isin(mask)]
+        # Convert wafertype to one-hot encoding
+        temp = filtered_df['wafertype'].astype(int).to_numpy()
+        wafertype_one_hot = np.zeros((temp.size, temp.max() + 1))
+        wafertype_one_hot[np.arange(temp.size), temp] = 1
 
-            waferu = ak.to_pandas(x.wafer.waferu)
-            waferu = waferu.loc[waferu.index.get_level_values('entry').isin(mask)]
+        # Assign the processed columns back to the DataFrame
+        filtered_df['wafertype'] = list(wafertype_one_hot)
+        filtered_df['sumCALQ'] = np.squeeze(filtered_df['sumCALQ'].to_numpy())
+        filtered_df['wafer_sim_energy'] = np.squeeze(filtered_df['wafer_sim_energy'].to_numpy())
+        filtered_df['wafer_energy'] = np.squeeze(filtered_df['wafer_energy'].to_numpy())
+        filtered_df['layer'] = np.squeeze(filtered_df['layer'].to_numpy())
+        
+        
 
-            wafertype = ak.to_pandas(x.wafer.wafertype)
-            wafertype = wafertype.loc[wafertype.index.get_level_values('entry').isin(mask)]
+        inputs = []
+        for i in range(64):
+            cur = filtered_df['AEin%d'%i]
+            cur = np.squeeze(cur.to_numpy())
+            inputs.append(cur) 
+        inputs = np.stack(inputs, axis=-1) #stack all 64 inputs
+        inputs = np.reshape(inputs, (-1, 8, 8))
+        
+        
+        
+        
+        
+        layer = filtered_df['layer'].to_numpy()
+        eta = filtered_df['eta'].to_numpy()
+        v = filtered_df['v'].to_numpy()
+        u = filtered_df['u'].to_numpy()
+        wafertype = np.array(filtered_df['wafertype'].tolist())
+        sumCALQ = filtered_df['sumCALQ'].to_numpy()
+        sumCALQ = np.log(sumCALQ+1)
+        wafer_sim_energy = filtered_df['wafer_sim_energy'].to_numpy()
+        wafer_energy = filtered_df['wafer_energy'].to_numpy()
+        data_list.append([inputs,eta,v,u,wafertype,sumCALQ,layer])
 
-            sumCALQ = ak.to_pandas(x.wafer['CALQ0'])
-            sumCALQ = sumCALQ.loc[sumCALQ.index.get_level_values('entry').isin(mask)]
+    
+    inputs_list = []
+    eta_list = []
+    v_list = []
+    u_list = []
+    wafertype_list = []
+    sumCALQ_list = []
+    layer_list = []
+    
+    for item in data_list:
+        inputs, eta, v, u, wafertype, sumCALQ,layer = item
+        inputs_list.append(inputs)
+        eta_list.append(eta)
+        v_list.append(v)
+        u_list.append(u)
+        wafertype_list.append(wafertype)
+        sumCALQ_list.append(sumCALQ)
+        layer_list.append(layer)
 
+    concatenated_inputs = np.expand_dims(np.concatenate(inputs_list),axis = -1)
+    concatenated_eta = np.expand_dims(np.concatenate(eta_list),axis = -1)
+    concatenated_v = np.expand_dims(np.concatenate(v_list),axis = -1)
+    concatenated_u = np.expand_dims(np.concatenate(u_list),axis = -1)
+    concatenated_wafertype = np.concatenate(wafertype_list)
+    concatenated_sumCALQ = np.expand_dims(np.concatenate(sumCALQ_list),axis = -1)
+    concatenated_layer = np.expand_dims(np.concatenate(layer_list),axis = -1)
 
-            wafer_sim_energy = ak.to_pandas(x.wafer.simenergy)
-            wafer_sim_energy = wafer_sim_energy.loc[wafer_sim_energy.index.get_level_values('entry').isin(mask)]
+    concatenated_cond = np.hstack([concatenated_eta,concatenated_v,concatenated_u, concatenated_wafertype, concatenated_sumCALQ,concatenated_layer])
+    
+    
+    events = int(np.min([len(inputs), 1000000]))
+    indices = np.random.permutation(events)
+    # Calculate 80% of n
+    num_selected = int(0.8 * events)
 
-            wafer_energy = ak.to_pandas(x.wafer.energy)
-            wafer_energy = wafer_energy.loc[wafer_energy.index.get_level_values('entry').isin(mask)]
+    # Select the first 80% of the indices
+    train_indices = indices[:num_selected]
+    test_indices = indices[num_selected:]
+    wafer_train = concatenated_inputs[train_indices]
+    wafer_test = concatenated_inputs[test_indices]
 
+    cond_train = concatenated_cond[train_indices]
+    cond_test = concatenated_cond[test_indices]
+    if args.biased:
+        
+        wafer_train,cond_train = custom_resample(wafer_train,cond_train)
+        print(wafer_train.shape)
+        wafer_test,cond_test = custom_resample(wafer_test,cond_test)
+        
 
+    # Create the training dataset
+    train_dataset = tf.data.Dataset.from_tensor_slices((wafer_train,cond_train)
+    )
 
-            layers = np.squeeze(layers.to_numpy())
-            eta = np.squeeze(eta.to_numpy())/3.1
-            waferv = np.squeeze(waferv.to_numpy())/12
-            waferu = np.squeeze(waferu.to_numpy())/12
-            temp = np.squeeze(wafertype.to_numpy())
-            wafertype = np.zeros((temp.size, temp.max() + 1))
-            wafertype[np.arange(temp.size), temp] = 1
-            sumCALQ = np.squeeze(sumCALQ.to_numpy())
-            wafer_sim_energy = np.squeeze(wafer_sim_energy.to_numpy())
-            wafer_energy = np.squeeze(wafer_energy.to_numpy())
+    # Create the test dataset
+    test_dataset = tf.data.Dataset.from_tensor_slices((wafer_test,cond_test)
+    )
 
+    train_loader = train_dataset.batch(batchsize).shuffle(buffer_size=num_selected).prefetch(buffer_size=tf.data.AUTOTUNE)
 
-
-            for i in range(1,64):
-                cur = ak.to_pandas(x.wafer[f'CALQ{int(i)}'])
-                cur = cur.loc[cur.index.get_level_values('entry').isin(mask)]
-                cur = np.squeeze(cur.to_numpy())
-                sumCALQ = sumCALQ + cur
-
-            sumCALQ = np.log(sumCALQ+1)
-
-            inputs = []
-            for i in range(64):
-                cur = ak.to_pandas(x.wafer['AEin%d'%i])
-                cur = cur.loc[cur.index.get_level_values('entry').isin(mask)]
-                cur = np.squeeze(cur.to_numpy())
-                inputs.append(cur) 
-            print(len(inputs))
-            inputs = np.stack(inputs, axis=-1) #stack all 64 inputs
-            inputs = np.reshape(inputs, (-1, 8, 8))
-            select_eLinks = {5 : (layers<=11) & (layers>=5) ,
-                     4 : (layers==7) | (layers==11),
-                     3 : (layers==13),
-                     2 : (layers<7) | (layers>13),
-                     -1 : (layers>0)}
-            inputs = inputs[select_eLinks[eLinks]]
-            l =(layers[select_eLinks[eLinks]]-1)/(47-1)
-            eta = eta[select_eLinks[eLinks]]
-            waferv = waferv[select_eLinks[eLinks]]
-            waferu = waferu[select_eLinks[eLinks]]
-            wafertype = wafertype[select_eLinks[eLinks]]
-            sumCALQ = sumCALQ[select_eLinks[eLinks]]
-            wafer_sim_energy = wafer_sim_energy[select_eLinks[eLinks]]
-            wafer_energy = wafer_energy[select_eLinks[eLinks]]
-
-
-            if args.sim_e_cut:
-                mask = (wafer_sim_energy[select_eLinks[eLinks]] > 0) 
-                inputs = inputs[mask]
-                l =l[mask]
-                eta = eta[mask]
-                waferv = waferv[mask]
-                waferu = waferu[mask]
-                wafertype = wafertype[mask]
-                sumCALQ = sumCALQ[mask]
-
-
-            elif args.e_cut:
-                mask =  (wafer_energy[select_eLinks[eLinks]] > 10)
-
-                inputs = inputs[mask]
-                l =l[mask]
-                eta = eta[mask]
-                waferv = waferv[mask]
-                waferu = waferu[mask]
-                wafertype = wafertype[mask]
-                sumCALQ = sumCALQ[mask]
-
-            elif args.biased:
-                mask = (wafer_sim_energy > 0) 
-                indices_passing = np.where(mask)[0]
-                indices_not_passing = np.where(~mask)[0]
-                print(len(indices_passing) )
-                if args.b_percent is not None:
-                    k = args.b_percent /(1-args.b_percent)
-                else: 
-                    k = 3
-                desired_not_passing_count = int(len(indices_passing) / k) 
-                print(desired_not_passing_count)
-                selected_not_passing_indices = np.random.choice(indices_not_passing, size=desired_not_passing_count, replace=False)
-
-                new_mask_indices = np.concatenate((indices_passing, selected_not_passing_indices))
-                mask = np.zeros_like(wafer_sim_energy, dtype=bool)
-                mask[new_mask_indices] = True
-                print(np.shape(inputs))
-                print(np.shape(l))
-
-                inputs = inputs[mask]
-                l =l[mask]
-                eta = eta[mask]
-                waferv = waferv[mask]
-                waferu = waferu[mask]
-                wafertype = wafertype[mask]
-                sumCALQ = sumCALQ[mask]
-            data_list.append([inputs,eta,waferv,waferu,wafertype,sumCALQ,l])
-
-
-        inputs_list = []
-        eta_list = []
-        waferv_list = []
-        waferu_list = []
-        wafertype_list = []
-        sumCALQ_list = []
-        layer_list = []
-
-        for item in data_list:
-            inputs, eta, waferv, waferu, wafertype, sumCALQ,layers = item
-            inputs_list.append(inputs)
-            eta_list.append(eta)
-            waferv_list.append(waferv)
-            waferu_list.append(waferu)
-            wafertype_list.append(wafertype)
-            sumCALQ_list.append(sumCALQ)
-            layer_list.append(layers)
-
-        concatenated_inputs = np.expand_dims(np.concatenate(inputs_list),axis = -1)
-        concatenated_eta = np.expand_dims(np.concatenate(eta_list),axis = -1)
-        concatenated_waferv = np.expand_dims(np.concatenate(waferv_list),axis = -1)
-        concatenated_waferu = np.expand_dims(np.concatenate(waferu_list),axis = -1)
-        concatenated_wafertype = np.concatenate(wafertype_list)
-        concatenated_sumCALQ = np.expand_dims(np.concatenate(sumCALQ_list),axis = -1)
-        concatenated_layers = np.expand_dims(np.concatenate(layer_list),axis = -1)
-
-        concatenated_cond = np.hstack([concatenated_eta,concatenated_waferv,concatenated_waferu, concatenated_wafertype, concatenated_sumCALQ,concatenated_layers])
-
-        # Final list of concatenated arrays
-    #     final_concatenated_list = [concatenated_inputs, concatenated_eta, concatenated_waferv, concatenated_waferu, concatenated_wafertype, concatenated_sumCALQ]
-    #     final_concatenated_list = [concatenated_inputs, concatenated_cond]
+    test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=events-num_selected).prefetch(buffer_size=tf.data.AUTOTUNE)
 
 
-        all_dataset = tf.data.Dataset.from_tensor_slices((concatenated_inputs, concatenated_cond)
-        ).take(1000000)
-
-        total_size = len(all_dataset)  # Replace with your dataset's total size
-        print('total size: ',total_size)
-        # Define your splitting ratio
-        train_size = int(0.8 * total_size)
-        test_size = total_size - train_size
-
-        # Create the training dataset
-        train_dataset = all_dataset.take(train_size)
-
-        # Create the test dataset
-        test_dataset = all_dataset.skip(train_size).take(test_size)
-
-        train_loader = train_dataset.batch(batchsize).shuffle(buffer_size=train_size).prefetch(buffer_size=tf.data.AUTOTUNE)
-
-        test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=test_size).prefetch(buffer_size=tf.data.AUTOTUNE)
-
-
-        return train_loader, test_loader
+    return train_loader, test_loader
+    
+class keras_pad(Layer):
+    def call(self, x):
+        padding = tf.constant([[0,0],[0, 1], [0, 1], [0, 0]])
+        return tf.pad(
+        x, padding, mode='CONSTANT', constant_values=0, name=None
+    )
+    
+    
+class keras_minimum(Layer):
+    def call(self, x, sat_val = 1):
+        return tf.minimum(x,sat_val)
+    
+    
+class keras_floor(Layer):
+    def call(self, x):
+        if isinstance(x, tf.SparseTensor):
+            x = tf.sparse.to_dense(x)
+            
+        return tf.math.floor(x)
+      
+    
+    
+    
 args = p.parse_args()
 model_dir = args.opath
 if not os.path.exists(model_dir):
     os.system("mkdir -p "+model_dir)
 
-for eLinks in [2,3,4,5]:
+# Loop through each number of eLinks
+for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
      
     bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
     
@@ -472,7 +446,7 @@ for eLinks in [2,3,4,5]:
     dense_biasBits  = 6 
     encodedBits = 9
     CNN_kernel_size = 3
-    padding = tf.constant([[0,0],[0, 1], [0, 1], [0, 0]])
+    
 
 
     input_enc = Input(batch_shape=(batch,8,8, 1), name = 'Wafer')
@@ -483,16 +457,17 @@ for eLinks in [2,3,4,5]:
 
     # Quantizing input, 8 bit quantization, 1 bit for integer
     x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'input_quantization')(input_enc)
-    x = tf.pad(
-        x, padding, mode='CONSTANT', constant_values=0, name=None
-    )
+    x = keras_pad()(x)
+#     x = tf.pad(
+#         x, padding, mode='CONSTANT', constant_values=0, name=None
+#     )
     x = QConv2D(n_kernels,
                 CNN_kernel_size, 
                 strides=2,padding = 'valid', kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
                 name="conv2d")(x)
-
+    
     x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'act')(x)
-
+    
 
     x = Flatten()(x)
 
@@ -505,7 +480,9 @@ for eLinks in [2,3,4,5]:
     x = QActivation(qkeras.quantized_bits(bits = 9, integer = 1),name = 'latent_quantization')(x)
     latent = x
     if bitsPerOutput > 0 and maxBitsPerOutput > 0:
-        latent = tf.minimum(tf.math.floor(latent *  outputMaxIntSize) /  outputMaxIntSize, outputSaturationValue)
+        latent = keras_floor()(latent *  outputMaxIntSize)
+        latent = keras_minimum()(latent/outputMaxIntSize, sat_val = outputSaturationValue)
+#         latent = tf.minimum(tf.math.floor(latent *  outputMaxIntSize) /  outputMaxIntSize, outputSaturationValue)
 
     latent = concatenate([latent,cond],axis=1)
    
@@ -591,22 +568,7 @@ for eLinks in [2,3,4,5]:
 
 
 
-
     for epoch in range(start_epoch, args.nepochs):
-        if epoch == 20:
-            if args.pretrain_model:
-                print('Beginnning Fine Tuning')
-                if args.optim == 'adam':
-                    opt = tf.keras.optimizers.Adam(learning_rate = args.lr,weight_decay = 0.000025)
-                elif args.optim == 'lion':
-                    opt = tf.keras.optimizers.Lion(learning_rate = args.lr,weight_decay = 0.00025)
-                cae.compile(optimizer=opt, loss=telescopeMSE8x8)
-
-                cae.load_weights(model_dir+'/best-epoch.tf')
-                print('Loaded Best Pretrained Model')
-
-
-
         total_loss_train = 0
 
         for wafers, cond in train_loader:
@@ -625,9 +587,11 @@ for eLinks in [2,3,4,5]:
 
         total_loss_train = total_loss_train#/(len(train_loader))
         total_loss_val = total_loss_val#/(len(test_loader))
+#         if epoch % 25 == 0:
+#             print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
+#                 epoch, total_loss_train,  total_loss_val))
         print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
-            epoch, total_loss_train,  total_loss_val))
-
+                epoch, total_loss_train,  total_loss_val))
 
 
         loss_dict['train_loss'].append(total_loss_train)
@@ -647,17 +611,12 @@ for eLinks in [2,3,4,5]:
         plot_path = f"{model_dir}/loss_plot.png"
         plt.savefig(plot_path)
 
-#         print('463')
-#         df.to_csv("%s/" % model_dir + "/loss.csv")
-
-#         cae.save_weights(os.path.join(model_dir, f'epoch-{epoch}.tf'))
         if total_loss_val < best_val_loss:
-            print('New Best Model')
+            if epoch % 25 == 0:
+                print('New Best Model')
             best_val_loss = total_loss_val
             cae.save_weights(os.path.join(model_dir, 'best-epoch.tf'.format(epoch)))
             encoder.save_weights(os.path.join(model_dir, 'best-encoder-epoch.tf'.format(epoch)))
             decoder.save_weights(os.path.join(model_dir, 'best-decoder-epoch.tf'.format(epoch)))
-    # tf.saved_model.save(encoder, os.path.join(model_dir, 'best-encoder'))
-    # tf.saved_model.save(decoder, os.path.join(model_dir, 'best-decoder'))
     save_models(cae,args.mname,isQK = True)
 
