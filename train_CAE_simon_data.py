@@ -218,7 +218,7 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     for i,file in enumerate(files):
         x = NanoEventsFactory.from_root(file, treepath=tree).events()
 
-        min_pt = 0  # replace with your minimum value
+        min_pt = -1  # replace with your minimum value
         max_pt = 10e10  # replace with your maximum value
         gen_pt = ak.to_pandas(x.gen.pt).groupby(level=0).mean()
         mask = (gen_pt['values'] >= min_pt) & (gen_pt['values'] <= max_pt)
@@ -229,7 +229,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
         v = ak.to_pandas(x.wafer.waferv)
         u = ak.to_pandas(x.wafer.waferu)
         wafertype = ak.to_pandas(x.wafer.wafertype)
-        sumCALQ = ak.to_pandas(x.wafer['CALQ0'])
         wafer_sim_energy = ak.to_pandas(x.wafer.simenergy)
         wafer_energy = ak.to_pandas(x.wafer.energy)
         
@@ -239,7 +238,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
             'v': v.values.flatten(),
             'u': u.values.flatten(),
             'wafertype': wafertype.values.flatten(),
-            'sumCALQ': sumCALQ.values.flatten(),
             'wafer_sim_energy': wafer_sim_energy.values.flatten(),
             'wafer_energy': wafer_energy.values.flatten(),
             'layer': layer.values.flatten()
@@ -254,30 +252,24 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
             key = f'CALQ{int(i)}'
             data_dict[key] = ak.to_pandas(x.wafer[key]).values.flatten()
             
-
+        
         # Combine all data into a single DataFrame
         combined_df = pd.DataFrame(data_dict, index=eta.index)
-        filtered_df = combined_df
-        
-#         print('Size before pt filtering')
-#         print(len(combined_df))
-        
-#         # Filter the combined DataFrame using the mask filter
-#         filtered_df = combined_df.loc[combined_df.index.get_level_values('entry').isin(mask)]
         
         print('Size after pt filtering')
         print(len(filtered_df))
         # Make eLink filter
         filtered_key_df = key_df[key_df['trigLinks'] == float(eLinks)]
-
+        
+        calq_columns = [f'CALQ{i}' for i in range(64)]
+        combined_df['sumCALQ'] = combined_df[calq_columns].sum(axis=1)
         # Filter based on eLink allocations
-        filtered_df = pd.merge(filtered_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
+        filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
         
         print('Size after eLink filtering')
         print(len(filtered_df))
-              
-       
 
+        
         # Process the filtered DataFrame
         filtered_df['eta'] = filtered_df['eta'] / 3.1
         filtered_df['v'] = filtered_df['v'] / 12
@@ -285,7 +277,7 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
 
         # Convert wafertype to one-hot encoding
         temp = filtered_df['wafertype'].astype(int).to_numpy()
-        wafertype_one_hot = np.zeros((temp.size, temp.max() + 1))
+        wafertype_one_hot = np.zeros((temp.size, 3))
         wafertype_one_hot[np.arange(temp.size), temp] = 1
 
         # Assign the processed columns back to the DataFrame
@@ -295,7 +287,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
         filtered_df['wafer_energy'] = np.squeeze(filtered_df['wafer_energy'].to_numpy())
         filtered_df['layer'] = np.squeeze(filtered_df['layer'].to_numpy())
         
-        
 
         inputs = []
         for i in range(64):
@@ -304,9 +295,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
             inputs.append(cur) 
         inputs = np.stack(inputs, axis=-1) #stack all 64 inputs
         inputs = np.reshape(inputs, (-1, 8, 8))
-        
-        
-        
         
         
         layer = filtered_df['layer'].to_numpy()
@@ -349,7 +337,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
 
     concatenated_cond = np.hstack([concatenated_eta,concatenated_v,concatenated_u, concatenated_wafertype, concatenated_sumCALQ,concatenated_layer])
     
-    
     events = int(np.min([len(inputs), 1000000]))
     indices = np.random.permutation(events)
     # Calculate 80% of n
@@ -381,7 +368,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     train_loader = train_dataset.batch(batchsize).shuffle(buffer_size=num_selected).prefetch(buffer_size=tf.data.AUTOTUNE)
 
     test_loader = test_dataset.batch(batchsize).shuffle(buffer_size=events-num_selected).prefetch(buffer_size=tf.data.AUTOTUNE)
-
 
     return train_loader, test_loader
     
@@ -458,9 +444,6 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
     # Quantizing input, 8 bit quantization, 1 bit for integer
     x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'input_quantization')(input_enc)
     x = keras_pad()(x)
-#     x = tf.pad(
-#         x, padding, mode='CONSTANT', constant_values=0, name=None
-#     )
     x = QConv2D(n_kernels,
                 CNN_kernel_size, 
                 strides=2,padding = 'valid', kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
@@ -482,7 +465,6 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
     if bitsPerOutput > 0 and maxBitsPerOutput > 0:
         latent = keras_floor()(latent *  outputMaxIntSize)
         latent = keras_minimum()(latent/outputMaxIntSize, sat_val = outputSaturationValue)
-#         latent = tf.minimum(tf.math.floor(latent *  outputMaxIntSize) /  outputMaxIntSize, outputSaturationValue)
 
     latent = concatenate([latent,cond],axis=1)
    
@@ -585,14 +567,11 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
             total_loss_val = total_loss_val+loss
 
 
-        total_loss_train = total_loss_train#/(len(train_loader))
-        total_loss_val = total_loss_val#/(len(test_loader))
-#         if epoch % 25 == 0:
-#             print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
-#                 epoch, total_loss_train,  total_loss_val))
-        print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
+        total_loss_train = total_loss_train #/(len(train_loader))
+        total_loss_val = total_loss_val #/(len(test_loader))
+        if epoch % 25 == 0:
+            print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
                 epoch, total_loss_train,  total_loss_val))
-
 
         loss_dict['train_loss'].append(total_loss_train)
         loss_dict['val_loss'].append(total_loss_val)
