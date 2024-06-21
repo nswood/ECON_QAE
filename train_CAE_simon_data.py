@@ -256,12 +256,10 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
         # Combine all data into a single DataFrame
         combined_df = pd.DataFrame(data_dict, index=eta.index)
         
-        print('Size after pt filtering')
-        print(len(filtered_df))
         # Make eLink filter
         filtered_key_df = key_df[key_df['trigLinks'] == float(eLinks)]
         
-        calq_columns = [f'CALQ{i}' for i in range(64)]
+        calq_columns = [f'CALQ{i}' for i in range(1,64)]
         combined_df['sumCALQ'] = combined_df[calq_columns].sum(axis=1)
         # Filter based on eLink allocations
         filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')

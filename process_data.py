@@ -30,7 +30,7 @@ p.add_args(
     ('--opath', p.STR),('--b_percent', {'type': float}))
     
 
-def load_data(normalize = True):
+def load_data(normalize = True,eLinks = -1):
     from files import get_rootfiles
     from coffea.nanoevents import NanoEventsFactory
     import awkward as ak
@@ -43,7 +43,7 @@ def load_data(normalize = True):
     basepath = '/store/group/lpcpfnano/srothman/Nov08_2023_ECON_trainingdata'
     tree = 'FloatingpointThreshold0DummyHistomaxDummynTuple/HGCalTriggerNtuple'
     
-    files = get_rootfiles(hostid, basepath)
+    files = get_rootfiles(hostid, basepath)[0:50]
     
 
     #loop over all the files
@@ -78,13 +78,12 @@ def load_data(normalize = True):
         
         wafer_energy = ak.to_pandas(x.wafer.energy)
         wafer_energy = wafer_energy.loc[wafer_energy.index.get_level_values('entry').isin(mask)]
-
-
-
+        
+        
         layers = np.squeeze(layers.to_numpy())
-        eta = np.squeeze(eta.to_numpy())/3.1
-        waferv = np.squeeze(waferv.to_numpy())/12
-        waferu = np.squeeze(waferu.to_numpy())/12
+        eta = np.squeeze(eta.to_numpy())
+        waferv = np.squeeze(waferv.to_numpy())
+        waferu = np.squeeze(waferu.to_numpy())
         temp = np.squeeze(wafertype.to_numpy())
         wafertype = np.zeros((temp.size, temp.max() + 1))
         wafertype[np.arange(temp.size), temp] = 1
@@ -117,7 +116,7 @@ def load_data(normalize = True):
                  2 : (layers<7) | (layers>13),
                  -1 : (layers>0)}
         inputs = inputs[select_eLinks[eLinks]]
-        l =(layers[select_eLinks[eLinks]]-1)/(47-1)
+        l =layers[select_eLinks[eLinks]]
         eta = eta[select_eLinks[eLinks]]
         waferv = waferv[select_eLinks[eLinks]]
         waferu = waferu[select_eLinks[eLinks]]
@@ -128,31 +127,31 @@ def load_data(normalize = True):
 
         
         
-        mask = (wafer_sim_energy > 0) 
-        indices_passing = np.where(mask)[0]
-        indices_not_passing = np.where(~mask)[0]
+#         mask = (wafer_sim_energy > 0) 
+#         indices_passing = np.where(mask)[0]
+#         indices_not_passing = np.where(~mask)[0]
         
-        if args.b_percent is not None:
-            k = args.b_percent /(1-args.b_percent)
-        else: 
-            k = 3
-        desired_not_passing_count = int(len(indices_passing) / k) 
+#         if args.b_percent is not None:
+#             k = args.b_percent /(1-args.b_percent)
+#         else: 
+#             k = 3
+#         desired_not_passing_count = int(len(indices_passing) / k) 
         
-        selected_not_passing_indices = np.random.choice(indices_not_passing, size=desired_not_passing_count, replace=False)
+#         selected_not_passing_indices = np.random.choice(indices_not_passing, size=desired_not_passing_count, replace=False)
 
-        new_mask_indices = np.concatenate((indices_passing, selected_not_passing_indices))
-        mask = np.zeros_like(wafer_sim_energy, dtype=bool)
-        mask[new_mask_indices] = True
+#         new_mask_indices = np.concatenate((indices_passing, selected_not_passing_indices))
+#         mask = np.zeros_like(wafer_sim_energy, dtype=bool)
+#         mask[new_mask_indices] = True
         
 
-        inputs = inputs[mask]
-        l =l[mask]
-        eta = eta[mask]
-        waferv = waferv[mask]
-        waferu = waferu[mask]
-        wafertype = wafertype[mask]
-        sumCALQ = sumCALQ[mask]
-        data_list.append([inputs,eta,waferv,waferu,wafertype,sumCALQ,l])
+#         inputs = inputs[mask]
+#         l =l[mask]
+#         eta = eta[mask]
+#         waferv = waferv[mask]
+#         waferu = waferu[mask]
+#         wafertype = wafertype[mask]
+#         sumCALQ = sumCALQ[mask]
+        data_list.append([inputs,eta,waferv,waferu,wafertype,sumCALQ,l,wafer_sim_energy])
 
 
     inputs_list = []
@@ -162,9 +161,10 @@ def load_data(normalize = True):
     wafertype_list = []
     sumCALQ_list = []
     layer_list = []
+    wafer_sim_e = []
 
     for item in data_list:
-        inputs, eta, waferv, waferu, wafertype, sumCALQ,layers = item
+        inputs, eta, waferv, waferu, wafertype, sumCALQ,layers,wafer_sim_energy = item
         inputs_list.append(inputs)
         eta_list.append(eta)
         waferv_list.append(waferv)
@@ -172,6 +172,7 @@ def load_data(normalize = True):
         wafertype_list.append(wafertype)
         sumCALQ_list.append(sumCALQ)
         layer_list.append(layers)
+        wafer_sim_e.append(wafer_sim_energy)
 
     concatenated_inputs = np.expand_dims(np.concatenate(inputs_list),axis = -1)
     concatenated_eta = np.expand_dims(np.concatenate(eta_list),axis = -1)
@@ -180,8 +181,9 @@ def load_data(normalize = True):
     concatenated_wafertype = np.concatenate(wafertype_list)
     concatenated_sumCALQ = np.expand_dims(np.concatenate(sumCALQ_list),axis = -1)
     concatenated_layers = np.expand_dims(np.concatenate(layer_list),axis = -1)
+    concatenated_sim_e = np.expand_dims(np.concatenate(wafer_sim_e),axis = -1)
     
-    concatenated_cond = np.hstack([concatenated_eta,concatenated_waferv,concatenated_waferu, concatenated_wafertype, concatenated_sumCALQ,concatenated_layers])
+    concatenated_cond = np.hstack([concatenated_eta,concatenated_waferv,concatenated_waferu, concatenated_wafertype, concatenated_sumCALQ,concatenated_layers,concatenated_sim_e])
 
     # Final list of concatenated arrays
 #     final_concatenated_list = [concatenated_inputs, concatenated_eta, concatenated_waferv, concatenated_waferu, concatenated_wafertype, concatenated_sumCALQ]
@@ -202,7 +204,10 @@ def load_data(normalize = True):
 
     # Create the test dataset
     test_dataset = all_dataset.skip(train_size).take(test_size)
-    path = os.path.join(args.opath, f'{eLinks}_eLinks')
+    if eLinks == -1:
+        path = os.path.join(args.opath, f'all_eLinks')
+    else:
+        path = os.path.join(args.opath, f'{eLinks}_eLinks')
     tf.data.experimental.save(train_dataset, path+'_train')
     tf.data.experimental.save(test_dataset, path+'_test')
 
@@ -213,15 +218,13 @@ model_dir = args.opath
 if not os.path.exists(model_dir):
     os.system("mkdir -p "+model_dir)
 
-for eLinks in [5]:#[2,3,4,5]:
+for eLinks in [-1]:#[2,3,4,5]:
      
-    bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
-    
     print(f'Loading {eLinks} eLinks data')
 #     model_dir = os.path.join(args.opath, f'{eLinks}_eLinks')
 #     if not os.path.exists(model_dir):
 #         os.system("mkdir -p " + model_dir)
     
-    load_data()
+    load_data(eLinks = eLinks)
     
 
