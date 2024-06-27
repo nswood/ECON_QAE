@@ -76,8 +76,7 @@ p.add_args(
     ('--opath', p.STR),
     ('--mpath', p.STR),('--prepath', p.STR),('--continue_training', p.STORE_TRUE), ('--batchsize', p.INT),
     ('--lr', {'type': float}),
-    ('--num_files', p.INT),('--optim', p.STR),('--eLinks', p.INT),('--emd_pth', p.STR),('--sim_e_cut', p.STORE_TRUE),('--e_cut', p.STORE_TRUE),('--biased', p.STORE_TRUE),('--b_percent', {'type': float}),('--flat_eta', p.STORE_TRUE),('--flat_sum_CALQ', p.STORE_TRUE)
-    
+    ('--num_files', p.INT),('--optim', p.STR),('--model_per_eLink',  p.STORE_TRUE),('--model_per_bit_config',  p.STORE_TRUE),('--biased', p.STORE_TRUE), ('--alloc_geom', p.STR)
     
     
 )
@@ -178,9 +177,9 @@ def resample_indices(indices, energy, bin_edges, target_count, bin_index):
 from imblearn.over_sampling import RandomOverSampler
 from imblearn.under_sampling import RandomUnderSampler
 from collections import Counter
-def custom_resample(wafers,c):
+def custom_resample(wafers,c,simE):
     
-    label = (c[:,-1] != 0).astype(int)
+    label = (simE[:,0] != 0).astype(int)
     n = len(label)
     print(Counter(label))
     indices = np.expand_dims(np.arange(n),axis = -1)
@@ -197,14 +196,37 @@ def custom_resample(wafers,c):
     c_p = c[indices_p[:,0]]
     
     return wafers_p, c_p
+
+def get_old_mask(eLinks, df):
+    mask = pd.Series([False] * len(df))  # Initialize a mask with all False values
     
-def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
+    for eLink in eLinks:
+        if eLink == 5:
+            mask = mask | ((df['layer'] <= 11) & (df['layer'] >= 5))
+        elif eLink == 4:
+            mask = mask | ((df['layer'] == 7) | (df['layer'] == 11))
+        elif eLink == 3:
+            mask = mask | (df['layer'] == 13)
+        elif eLink == 2:
+            mask = mask | ((df['layer'] < 7) | (df['layer'] > 13))
+        elif eLink == -1:
+            mask = mask | (df['layer'] > 0)
+    
+    return mask
+
+    
+def load_data(nfiles,batchsize,model_info = -1, normalize = True):
     from files import get_rootfiles
     from coffea.nanoevents import NanoEventsFactory
     import awkward as ak
     import numpy as np
     ecr = np.vectorize(encode)
     data_list = []
+    simE_list = []
+    if args.model_per_eLink:
+        eLinks = model_info
+    elif args.model_per_bit_config:
+        bitsPerOutput = model_info
 
     # Paths to Simon's dataset
     hostid = 'cmseos.fnal.gov'
@@ -255,23 +277,37 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
         
         # Combine all data into a single DataFrame
         combined_df = pd.DataFrame(data_dict, index=eta.index)
-        
-        # Make eLink filter
-        filtered_key_df = key_df[key_df['trigLinks'] == float(eLinks)]
-        
         calq_columns = [f'CALQ{i}' for i in range(1,64)]
         combined_df['sumCALQ'] = combined_df[calq_columns].sum(axis=1)
-        # Filter based on eLink allocations
-        filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
         
+        if args.alloc_geom == 'new':
+            if args.model_per_eLink:
+                filtered_key_df = key_df[key_df['trigLinks'] == float(eLinks)]
+                filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
+            elif args.model_per_bit_config:
+                eLinks_with_bit_alloc = [index for index, value in enumerate(bitsPerOutputLink) if value == bitsPerOutput]
+                eLinks_with_bit_alloc = [float(b) for b in eLinks_with_bit_alloc if b < 12]
+                filtered_key_df = key_df[key_df['trigLinks'].isin(eLinks_with_bit_alloc)]
+                filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
+        
+        elif args.alloc_geom =='old':
+            if args.model_per_eLink:
+                mask = get_old_mask(eLinks, combined_df)
+                filtered_df = combined_df[mask]
+            elif args.model_per_bit_config:
+                eLinks_with_bit_alloc = [index for index, value in enumerate(bitsPerOutputLink) if value == bitsPerOutput]
+                eLinks_with_bit_alloc = [b for b in eLinks_with_bit_alloc if b < 6]
+                mask = get_old_mask(eLinks_with_bit_alloc, combined_df)
+                filtered_df = combined_df[mask]
+            
         print('Size after eLink filtering')
         print(len(filtered_df))
-
         
         # Process the filtered DataFrame
         filtered_df['eta'] = filtered_df['eta'] / 3.1
         filtered_df['v'] = filtered_df['v'] / 12
         filtered_df['u'] = filtered_df['u'] / 12
+        filtered_df['layer'] = (filtered_df['layer']-1) / 46
 
         # Convert wafertype to one-hot encoding
         temp = filtered_df['wafertype'].astype(int).to_numpy()
@@ -305,6 +341,7 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
         wafer_sim_energy = filtered_df['wafer_sim_energy'].to_numpy()
         wafer_energy = filtered_df['wafer_energy'].to_numpy()
         data_list.append([inputs,eta,v,u,wafertype,sumCALQ,layer])
+        simE_list.append(wafer_sim_energy)
 
     
     inputs_list = []
@@ -332,10 +369,10 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     concatenated_wafertype = np.concatenate(wafertype_list)
     concatenated_sumCALQ = np.expand_dims(np.concatenate(sumCALQ_list),axis = -1)
     concatenated_layer = np.expand_dims(np.concatenate(layer_list),axis = -1)
-
+    concatenated_simE = np.expand_dims(np.concatenate(simE_list),axis = -1)
     concatenated_cond = np.hstack([concatenated_eta,concatenated_v,concatenated_u, concatenated_wafertype, concatenated_sumCALQ,concatenated_layer])
     
-    events = int(np.min([len(inputs), 1000000]))
+    events = int(np.min([len(inputs), 10000000]))
     indices = np.random.permutation(events)
     # Calculate 80% of n
     num_selected = int(0.8 * events)
@@ -345,14 +382,16 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     test_indices = indices[num_selected:]
     wafer_train = concatenated_inputs[train_indices]
     wafer_test = concatenated_inputs[test_indices]
+    
+    simE_train = concatenated_simE[train_indices]
+    simE_test = concatenated_simE[test_indices]
 
     cond_train = concatenated_cond[train_indices]
     cond_test = concatenated_cond[test_indices]
     if args.biased:
-        
-        wafer_train,cond_train = custom_resample(wafer_train,cond_train)
+        wafer_train,cond_train = custom_resample(wafer_train,cond_train,simE_train)
         print(wafer_train.shape)
-        wafer_test,cond_test = custom_resample(wafer_test,cond_test)
+        wafer_test,cond_test = custom_resample(wafer_test,cond_test, simE_test)
         
 
     # Create the training dataset
@@ -398,15 +437,32 @@ if not os.path.exists(model_dir):
     os.system("mkdir -p "+model_dir)
 
 # Loop through each number of eLinks
-for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
-     
-    bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+
+if args.model_per_eLink:
+    if args.alloc_geom == 'old':
+        all_models = [2,3,4,5]
+    elif args.alloc_geom =='new':
+        all_models = [1,2,3,4,5,6,7,8,9,10,11]
+elif args.model_per_bit_config:
+    all_models = [1,3,5,7,9]
+
+
+bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]    
+
+for m in all_models:
+    if args.model_per_eLink:
+        eLinks = m
+        bitsPerOutput = bitsPerOutputLink[eLinks]
+        print(f'Training Model with {eLinks} eLinks')
+        model_dir = os.path.join(args.opath, f'model_{eLinks}_eLinks')
+    elif args.model_per_bit_config:
+        bitsPerOutput = m
+        print(f'Training Model with {bitsPerOutput} output bits')
+        model_dir = os.path.join(args.opath, f'model_{bitsPerOutput}_bits')
     
-    print(f'Training Model with {eLinks} eLinks')
-    model_dir = os.path.join(args.opath, f'model_{eLinks}_eLinks')
     if not os.path.exists(model_dir):
         os.system("mkdir -p " + model_dir)
-    bitsPerOutput = bitsPerOutputLink[eLinks]
+    
     nIntegerBits = 1;
     nDecimalBits = bitsPerOutput - nIntegerBits;
     outputSaturationValue = (1 << nIntegerBits) - 1./(1 << nDecimalBits);
@@ -509,8 +565,21 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
 
     cae.compile(optimizer=opt, loss=loss)
     cae.summary()
+    def cosine_annealing(epoch, total_epochs, initial_lr):
+        """Cosine annealing scheduler."""
+        cos_inner = np.pi * (epoch % (total_epochs // 10))
+        cos_inner /= total_epochs // 10
+        cos_out = np.cos(cos_inner) + 1
+        return float(initial_lr / 2 * cos_out)
 
+    
+    initial_lr = args.lr
+    total_epochs = args.nepochs
 
+    # Create a learning rate scheduler callback
+    lr_scheduler = tf.keras.callbacks.LearningRateScheduler(
+        lambda epoch: cosine_annealing(epoch, total_epochs, initial_lr)
+    )
 
     # Loading Model
     if args.continue_training:
@@ -527,7 +596,7 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
 
 
     print('Loading Data')
-    train_loader, test_loader = load_data(args.num_files,batch,eLinks =eLinks)
+    train_loader, test_loader = load_data(args.num_files,batch,model_info =m)
     print('Data Loaded')
 
 
@@ -550,11 +619,15 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
 
     for epoch in range(start_epoch, args.nepochs):
         total_loss_train = 0
+        new_lr = cosine_annealing(epoch, total_epochs, initial_lr)
+#         print(new_lr)
+        tf.keras.backend.set_value(opt.learning_rate, new_lr)
 
         for wafers, cond in train_loader:
 
             loss = cae.train_on_batch([wafers,cond], wafers)
             total_loss_train = total_loss_train + loss
+        
 
         total_loss_val = 0 
         for wafers, cond in test_loader:
@@ -565,8 +638,8 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
             total_loss_val = total_loss_val+loss
 
 
-        total_loss_train = total_loss_train #/(len(train_loader))
-        total_loss_val = total_loss_val #/(len(test_loader))
+        total_loss_train = total_loss_train /(len(train_loader))
+        total_loss_val = total_loss_val /(len(test_loader))
         if epoch % 25 == 0:
             print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
                 epoch, total_loss_train,  total_loss_val))
@@ -587,6 +660,8 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
         # Saving the plot in the same directory as the loss CSV
         plot_path = f"{model_dir}/loss_plot.png"
         plt.savefig(plot_path)
+        df.to_csv(f"{model_dir}/df.csv", index=False)
+        
 
         if total_loss_val < best_val_loss:
             if epoch % 25 == 0:
