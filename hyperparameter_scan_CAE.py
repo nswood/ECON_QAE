@@ -34,7 +34,7 @@ p.add_args(
     ('--mpath', p.STR), 
     ('--num_files', p.INT), ('--model_per_eLink',  p.STORE_TRUE), ('--model_per_bit_config',  p.STORE_TRUE),
     ('--alloc_geom', p.STR),
-    ('--data_path', p.STR)
+    ('--data_path', p.STR) 
 )
 
 remap_8x8 = [4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31,
@@ -133,6 +133,8 @@ if not os.path.exists(model_dir):
 if args.model_per_eLink:
     if args.alloc_geom == 'old':
         all_models = [2, 3, 4, 5]
+#         all_models = [2]
+        
     elif args.alloc_geom == 'new':
         all_models = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 elif args.model_per_bit_config:
@@ -177,12 +179,12 @@ for m in all_models:
     # Set up hyperparameter tuning
     def build_model(hp):
         # Hyperparameters
-        learning_rate = hp.Float('learning_rate', min_value=1e-5, max_value=1e-3, sampling='log')
-        num_decoder_layers = hp.Int('num_decoder_layers', min_value=1, max_value=5)
-        units_in_decoder = hp.Int('units_in_decoder', min_value=32, max_value=256, step=32)
-        batch_size = hp.Int('batch_size', min_value=256, max_value=4096, step=256)
-        num_epochs = hp.Int('num_epochs', min_value=20, max_value=500, step=50)
-#         num_epochs = hp.Int('num_epochs', min_value=11, max_value=13, step=1)
+        learning_rate = hp.Float('learning_rate', min_value=1e-5, max_value=5e-4, sampling='log')
+        batch_size = hp.Int('batch_size', min_value=512, max_value=4096, step=256)
+        num_epochs = hp.Int('num_epochs', min_value=50, max_value=250, step=50)
+        lr_scheduler = hp.Choice('lr_sched', values=['cos', 'cos_warm_restarts'])
+
+        #         num_epochs = hp.Int('num_epochs', min_value=11, max_value=13, step=1)
 
         # Fixed parameters
         n_kernels = 8
@@ -227,12 +229,10 @@ for m in all_models:
         # Decoder
         input_dec = Input(shape=(24,))
         y = input_dec
-
-        for i in range(num_decoder_layers):
-            units = units_in_decoder
-            y = Dense(units)(y)
-            y = ReLU()(y)
-
+        y = Dense(24)(input_dec)
+        y = ReLU()(y)
+        y = Dense(64)(y)
+        y = ReLU()(y)
         y = Dense(128)(y)
         y = ReLU()(y)
         y = Reshape((4, 4, 8))(y)
@@ -263,7 +263,7 @@ for m in all_models:
     tuner = kt.BayesianOptimization(
         hypermodel=build_model,
         objective='val_loss',
-        max_trials=50,  # Increase trials for better optimization
+        max_trials=20,  # Increase trials for better optimization
         directory='scan_output',
         project_name=model_name
     )
@@ -275,24 +275,53 @@ for m in all_models:
         return train_loader, test_loader
     fit_kwargs = {}
 
-    # Custom callback to pass data loaders to the tuner
+    # Define learning rate scheduling functions
+    def cos_warm_restarts(epoch, total_epochs, initial_lr):
+        """Cosine annealing scheduler with warm restarts."""
+        cos_inner = np.pi * (epoch % (total_epochs // 25))
+        cos_inner /= total_epochs // 25
+        cos_out = np.cos(cos_inner) + 1
+        return float(initial_lr / 2 * cos_out)
+
+    def cosine_annealing(epoch, total_epochs, initial_lr):
+        """Cosine annealing scheduler that reduces the learning rate to 1/100 of the initial value."""
+        cos_inner = np.pi * (epoch % total_epochs) / total_epochs
+        cos_out = np.cos(cos_inner) + 1
+        return float((initial_lr / 2) * cos_out * (1 / 100))
+
+
     class MyTuner(kt.BayesianOptimization):
-        def run_trial(self, trial, *args, **kwargs):
+        def run_trial(self, trial, **kwargs):
             hp = trial.hyperparameters
             train_loader, test_loader = get_data_loaders(hp)
-            # Get the number of epochs from hyperparameters
+
+            # Get the number of epochs and learning rate from hyperparameters
             epochs = hp.get('num_epochs')
-            # Pass epochs to fit arguments
-            fit_kwargs.update({'epochs': epochs})
-            # Update fit arguments with data loaders
-            fit_kwargs.update({'x': train_loader, 'validation_data': test_loader})
+            initial_lr = hp.get('learning_rate')
+            lr_sched = hp.get('lr_sched')
+            if lr_sched == 'cos_warm_restarts':
+                lr_schedule = lambda epoch: cos_warm_restarts(epoch, total_epochs=epochs, initial_lr=initial_lr)
+            elif lr_sched == 'cos':
+                lr_schedule = lambda epoch: cosine_annealing(epoch, total_epochs=epochs, initial_lr=initial_lr)
+
+            # Define the LearningRateScheduler callback with the dynamically updated lr_schedule
+            lr_scheduler = tf.keras.callbacks.LearningRateScheduler(lr_schedule)
+
+            # Update fit arguments with data loaders and callbacks
+            fit_kwargs.update({
+                'x': train_loader,
+                'validation_data': test_loader,
+                'epochs': epochs,
+                'callbacks': [lr_scheduler]  # Adding the LR scheduler here
+            })
+
             # Call the parent run_trial and return the results
             return super(MyTuner, self).run_trial(trial, **fit_kwargs)
 
     tuner = MyTuner(
         hypermodel=build_model,
         objective='val_loss',
-        max_trials=2,
+        max_trials=20,
         directory=args.opath,
         project_name=model_name
     )
@@ -307,11 +336,21 @@ for m in all_models:
     print(f"""
     The hyperparameter search is complete.
     Optimal learning rate: {best_hps.get('learning_rate')}
-    Optimal number of decoder layers: {best_hps.get('num_decoder_layers')}
-    Optimal units in decoder layers: {best_hps.get('units_in_decoder')}
     Optimal batch size: {best_hps.get('batch_size')}
     Optimal number of epochs: {best_hps.get('num_epochs')}
     """)
+    content = f"""
+    The hyperparameter search is complete.
+    Optimal learning rate: {best_hps.get('learning_rate')}
+    Optimal batch size: {best_hps.get('batch_size')}
+    Optimal number of epochs: {best_hps.get('num_epochs')}
+    Optimal LR scheduler: {best_hps.get('lr_sched')}
+    """
+    file_path = os.path.join(model_dir, "hyperparameter_search_results.txt")
+    with open(file_path, "w") as file:
+        file.write(content)
+
+    
 
     # Build the model with the optimal hyperparameters
     model = tuner.hypermodel.build(best_hps)
@@ -319,21 +358,22 @@ for m in all_models:
     # Get data loaders with optimal batch size
     train_loader, test_loader = load_pre_processed_data(args.num_files, best_hps.get('batch_size'), bitsPerOutput)
 
-    # Define a learning rate scheduler
-    def cosine_annealing(epoch, total_epochs, initial_lr):
-        """Cosine annealing scheduler."""
-        cos_inner = np.pi * (epoch % (total_epochs // 10))
-        cos_inner /= total_epochs // 10
-        cos_out = np.cos(cos_inner) + 1
-        return float(initial_lr / 2 * cos_out)
 
     initial_lr = best_hps.get('learning_rate')
     total_epochs = best_hps.get('num_epochs')
+    lr_sched = best_hps.get('lr_sched')
 
-    # Create a learning rate scheduler callback
-    lr_scheduler = tf.keras.callbacks.LearningRateScheduler(
-        lambda epoch: cosine_annealing(epoch, total_epochs, initial_lr)
-    )
+    
+    if lr_sched == 'cos_warm_restarts':
+
+        lr_scheduler = tf.keras.callbacks.LearningRateScheduler(
+            lambda epoch: cos_warm_restarts(epoch, total_epochs, initial_lr)
+        )
+
+    elif lr_sched == 'cos':
+        lr_scheduler = tf.keras.callbacks.LearningRateScheduler(
+            lambda epoch: cosine_annealing(epoch, total_epochs, initial_lr)
+        )
 
     # Train the model with the optimal hyperparameters
     history = model.fit(
