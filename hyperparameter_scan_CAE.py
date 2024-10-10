@@ -1,6 +1,19 @@
 import numpy as np
 import pandas as pd
+import os
 import tensorflow as tf
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+    # Currently, memory growth needs to be the same across GPUs
+        for gpu in gpus:
+          tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    except RuntimeError as e:
+        # Memory growth must be set before GPUs have been initialized
+        print(e)
+
 from tensorflow import keras
 from keras import layers
 from keras.layers import Layer
@@ -13,6 +26,16 @@ from telescope import *
 from utils import *
 import inspect
 import json
+
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        tf.config.experimental.set_virtual_device_configuration(
+            gpus[0],
+            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=2048)])  # Set limit to 2048 MB (2GB)
+    except RuntimeError as e:
+        print(e)
 
 import os
 import sys
@@ -34,7 +57,7 @@ p.add_args(
     ('--mpath', p.STR), 
     ('--num_files', p.INT), ('--model_per_eLink',  p.STORE_TRUE), ('--model_per_bit_config',  p.STORE_TRUE),
     ('--alloc_geom', p.STR),
-    ('--data_path', p.STR) 
+    ('--data_path', p.STR)
 )
 
 remap_8x8 = [4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31,
@@ -60,8 +83,9 @@ def get_pams():
     return jsonpams
 
 
-def load_pre_processed_data(nfiles, batchsize, bits):
-    files = os.listdir(os.path.join(args.data_path, f'data_{bits}_eLinks'))
+def load_pre_processed_data(nfiles, batchsize, cur_eLinks):
+    print(f'data_{cur_eLinks}_eLinks')
+    files = os.listdir(os.path.join(args.data_path, f'data_{cur_eLinks}_eLinks'))
 
     train_files = [f for f in files if 'train' in f][0:nfiles]
     test_files = [f for f in files if 'test' in f][0:nfiles]
@@ -69,22 +93,30 @@ def load_pre_processed_data(nfiles, batchsize, bits):
     # Load and combine all training files
     train_datasets = []
     for file in train_files:
-        train_datasets.append(tf.data.experimental.load(os.path.join(args.data_path, f'data_{bits}_eLinks', file)))
+        train_datasets.append(tf.data.experimental.load(os.path.join(args.data_path, f'data_{cur_eLinks}_eLinks', file)))
 
     # Combine all loaded training datasets
     train_dataset = train_datasets[0]
     for ds in train_datasets[1:]:
         train_dataset = train_dataset.concatenate(ds)
+        
+    # Limit the training dataset to 1M samples
+    train_dataset = train_dataset.take(1_000_000)
+
 
     # Load and combine all test files
     test_datasets = []
     for file in test_files:
-        test_datasets.append(tf.data.experimental.load(os.path.join(args.data_path, f'data_{bits}_eLinks', file)))
+        test_datasets.append(tf.data.experimental.load(os.path.join(args.data_path, f'data_{cur_eLinks}_eLinks', file)))
 
     # Combine all loaded test datasets
     test_dataset = test_datasets[0]
     for ds in test_datasets[1:]:
         test_dataset = test_dataset.concatenate(ds)
+        
+    # Limit the test dataset to 200k samples
+    test_dataset = test_dataset.take(200_000)
+
 
     print("Training dataset size:", train_dataset.cardinality().numpy())
     print("Test dataset size:", test_dataset.cardinality().numpy())
@@ -132,9 +164,10 @@ if not os.path.exists(model_dir):
 
 if args.model_per_eLink:
     if args.alloc_geom == 'old':
-        all_models = [2, 3, 4, 5]
-#         all_models = [2]
-        
+#         all_models = [2,3]
+#         all_models = [4,5]
+        all_models = [5]
+
     elif args.alloc_geom == 'new':
         all_models = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 elif args.model_per_bit_config:
@@ -145,6 +178,7 @@ elif args.model_per_bit_config:
 
 bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
 
+print(all_models)
 for m in all_models:
     if args.model_per_eLink:
         eLinks = m
@@ -159,7 +193,7 @@ for m in all_models:
         model_dir = os.path.join(args.opath, f'model_{bitsPerOutput}_bits')
         model_name = f'model_{bitsPerOutput}_bits'
         
-
+    print(m)
     if not os.path.exists(model_dir):
         os.system("mkdir -p " + model_dir)
 
@@ -177,10 +211,10 @@ for m in all_models:
         outputMaxIntSizeGlobal = 1 << (maxBitsPerOutput - nIntegerBits)
 
     # Set up hyperparameter tuning
-    def build_model(hp):
+    def build_model(hp, enc_dec = False):
         # Hyperparameters
-        learning_rate = hp.Float('learning_rate', min_value=1e-5, max_value=5e-4, sampling='log')
-        batch_size = hp.Int('batch_size', min_value=512, max_value=4096, step=256)
+        learning_rate = hp.Float('learning_rate', min_value=1e-6, max_value=1e-3, sampling='log')
+        batch_size = hp.Int('batch_size', min_value=128, max_value=4096, step=256)
         num_epochs = hp.Int('num_epochs', min_value=50, max_value=250, step=50)
         lr_scheduler = hp.Choice('lr_sched', values=['cos', 'cos_warm_restarts'])
 
@@ -255,9 +289,10 @@ for m in all_models:
         opt = tf.keras.optimizers.Lion(learning_rate=learning_rate, weight_decay=0.00025)
 
         cae.compile(optimizer=opt, loss=loss)
-
-        return cae
-
+        if enc_dec:
+            return cae, encoder, decoder
+        else:
+            return cae
     
     # Set up the tuner using Bayesian Optimization
     tuner = kt.BayesianOptimization(
@@ -271,7 +306,9 @@ for m in all_models:
     # Function to get data loaders based on hyperparameters
     def get_data_loaders(hp):
         batch_size = hp.get('batch_size')
-        train_loader, test_loader = load_pre_processed_data(args.num_files, batch_size, bitsPerOutput)
+        print('Loading')
+        print(eLinks)
+        train_loader, test_loader = load_pre_processed_data(args.num_files, batch_size, eLinks)
         return train_loader, test_loader
     fit_kwargs = {}
 
@@ -332,12 +369,16 @@ for m in all_models:
 
     # Retrieve the best hyperparameters
     best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    best_trial = tuner.oracle.get_best_trials(num_trials=1)[0]
+    best_performance = best_trial.score  # This retrieves the best score (e.g., validation loss)
 
     print(f"""
     The hyperparameter search is complete.
     Optimal learning rate: {best_hps.get('learning_rate')}
     Optimal batch size: {best_hps.get('batch_size')}
     Optimal number of epochs: {best_hps.get('num_epochs')}
+    Optimal LR scheduler: {best_hps.get('lr_sched')}
+    Best performance: {best_performance}
     """)
     content = f"""
     The hyperparameter search is complete.
@@ -345,6 +386,7 @@ for m in all_models:
     Optimal batch size: {best_hps.get('batch_size')}
     Optimal number of epochs: {best_hps.get('num_epochs')}
     Optimal LR scheduler: {best_hps.get('lr_sched')}
+    Best performance: {best_performance}
     """
     file_path = os.path.join(model_dir, "hyperparameter_search_results.txt")
     with open(file_path, "w") as file:
@@ -353,10 +395,10 @@ for m in all_models:
     
 
     # Build the model with the optimal hyperparameters
-    model = tuner.hypermodel.build(best_hps)
+    model, encoder, decoder = tuner.hypermodel.build(best_hps,enc_dec = True)
 
     # Get data loaders with optimal batch size
-    train_loader, test_loader = load_pre_processed_data(args.num_files, best_hps.get('batch_size'), bitsPerOutput)
+    train_loader, test_loader = load_pre_processed_data(args.num_files, best_hps.get('batch_size'), m)
 
 
     initial_lr = best_hps.get('learning_rate')
@@ -384,4 +426,7 @@ for m in all_models:
     )
 
     # Save the model
+    
     model.save(os.path.join(model_dir, 'best_model.h5'))
+    encoder.save_weights(os.path.join(model_dir, 'best-encoder-epoch.tf'))
+    decoder.save_weights(os.path.join(model_dir, 'best-decoder-epoch.tf'))
