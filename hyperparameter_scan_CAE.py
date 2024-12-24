@@ -57,7 +57,8 @@ p.add_args(
     ('--mpath', p.STR), 
     ('--num_files', p.INT), ('--model_per_eLink',  p.STORE_TRUE), ('--model_per_bit_config',  p.STORE_TRUE),
     ('--alloc_geom', p.STR),
-    ('--data_path', p.STR)
+    ('--data_path', p.STR),
+    ('--ft_search',  p.STORE_TRUE)
 )
 
 remap_8x8 = [4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31,
@@ -131,6 +132,24 @@ def load_pre_processed_data(nfiles, batchsize, cur_eLinks):
 
     return train_loader, test_loader
 
+def extract_hyperparameters(file_path):
+    hyperparams = {}
+    with open(file_path, "r") as file:
+        lines = file.readlines()
+        for line in lines:
+            if 'Optimal learning rate' in line:
+                hyperparams['learning_rate'] = float(line.split(':')[-1].strip())
+            elif 'Optimal batch size' in line:
+                hyperparams['batch_size'] = int(line.split(':')[-1].strip())
+            elif 'Optimal number of epochs' in line:
+                hyperparams['num_epochs'] = int(line.split(':')[-1].strip())
+            elif 'Optimal LR scheduler' in line:
+                hyperparams['lr_sched'] = line.split(':')[-1].strip()
+            elif 'Best performance' in line:
+                hyperparams['best_performance'] = float(line.split(':')[-1].strip())
+    print('Loaded hyperparameters')
+    print(hyperparams)
+    return hyperparams
 
 
 class keras_pad(Layer):
@@ -166,7 +185,9 @@ if args.model_per_eLink:
     if args.alloc_geom == 'old':
 #         all_models = [2,3]
 #         all_models = [4,5]
-        all_models = [5]
+        all_models = [4,5]
+
+#         all_models = [2,3]
 
     elif args.alloc_geom == 'new':
         all_models = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -213,10 +234,27 @@ for m in all_models:
     # Set up hyperparameter tuning
     def build_model(hp, enc_dec = False):
         # Hyperparameters
-        learning_rate = hp.Float('learning_rate', min_value=1e-6, max_value=1e-3, sampling='log')
-        batch_size = hp.Int('batch_size', min_value=128, max_value=4096, step=256)
-        num_epochs = hp.Int('num_epochs', min_value=50, max_value=250, step=50)
-        lr_scheduler = hp.Choice('lr_sched', values=['cos', 'cos_warm_restarts'])
+        if args.ft_search:
+            file_path = os.path.join(args.opath,model_name,'hyperparameter_search_results.txt')
+            best_hyperparams = extract_hyperparameters(file_path)
+            learning_rate = hp.Float('learning_rate', 
+                                     min_value=best_hyperparams['learning_rate']/2, 
+                                     max_value=best_hyperparams['learning_rate']*2, 
+                                     sampling='log')
+            batch_size = hp.Int('batch_size', 
+                                min_value=int(best_hyperparams['batch_size']/2), 
+                                max_value=best_hyperparams['batch_size']*2, 
+                                step=int(best_hyperparams['batch_size']/16))
+            num_epochs = hp.Int('num_epochs', 
+                                min_value=int(best_hyperparams['num_epochs']*0.75), 
+                                max_value=best_hyperparams['num_epochs']*2, 
+                                step=50)
+            lr_scheduler = hp.Choice('lr_sched', values=[best_hyperparams['lr_sched']])
+        else:
+            learning_rate = hp.Float('learning_rate', min_value=1e-6, max_value=1e-3, sampling='log')
+            batch_size = hp.Int('batch_size', min_value=128, max_value=4096, step=256)
+            num_epochs = hp.Int('num_epochs', min_value=50, max_value=250, step=50)
+            lr_scheduler = hp.Choice('lr_sched', values=['cos', 'cos_warm_restarts'])
 
         #         num_epochs = hp.Int('num_epochs', min_value=11, max_value=13, step=1)
 
@@ -355,17 +393,32 @@ for m in all_models:
             # Call the parent run_trial and return the results
             return super(MyTuner, self).run_trial(trial, **fit_kwargs)
 
+    
+    if args.ft_search:
+        trials = 10
+        opath = args.opath+'_ft'
+    else:
+        trials = 20
+        opath = args.opath
+    
     tuner = MyTuner(
         hypermodel=build_model,
         objective='val_loss',
-        max_trials=20,
-        directory=args.opath,
+        max_trials=trials,
+        directory=opath,
         project_name=model_name
     )
     
+    from tensorflow.keras.callbacks import ModelCheckpoint
+    checkpoint_cb = ModelCheckpoint(
+    filepath='best-model.tf',
+    save_best_only=True,  # Only save the best model
+    monitor='val_loss',   # Monitor validation loss for the best model
+    mode='min'            # Save when val_loss is minimized
+    )
     print('Starting search')
     # Start the hyperparameter search
-    tuner.search()
+    tuner.search(callbacks=[checkpoint_cb])
 
     # Retrieve the best hyperparameters
     best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
@@ -391,8 +444,6 @@ for m in all_models:
     file_path = os.path.join(model_dir, "hyperparameter_search_results.txt")
     with open(file_path, "w") as file:
         file.write(content)
-
-    
 
     # Build the model with the optimal hyperparameters
     model, encoder, decoder = tuner.hypermodel.build(best_hps,enc_dec = True)
@@ -424,7 +475,7 @@ for m in all_models:
         epochs=total_epochs,
         callbacks=[lr_scheduler]
     )
-
+    
     # Save the model
     
     model.save(os.path.join(model_dir, 'best_model.h5'))

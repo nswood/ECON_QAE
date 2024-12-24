@@ -27,11 +27,13 @@ import mplhep as hep
 p = ArgumentParser()
 p.add_args(
     ('--mname', p.STR),
-    
-    ('--mpath', p.STR)
-   
-    
-    
+    ('--mpath', p.STR), 
+    ('--model_per_eLink',  p.STORE_TRUE),
+    ('--model_per_bit_config',  p.STORE_TRUE),
+    ('--alloc_geom', p.STR),
+    ('--load_from_scan', p.STORE_TRUE),
+    ('--specific_m',  p.INT),
+     
 )
 
     
@@ -60,23 +62,14 @@ def get_pams():
 
 def save_models(encoder,decoder, name, isQK=False):
 
-#     json_string = autoencoder.to_json()
-   
     f'./{model_dir}/{name}.json'
-    encoder.save_weights(f'./{model_dir}/encoder_{name}.hdf5')
-    decoder.save_weights(f'./{model_dir}/decoder_{name}.hdf5')
     if isQK:
         encoder_qWeight = model_save_quantized_weights(encoder)
         with open(f'{model_dir}/encoder_{name}.pkl','wb') as f:
             pickle.dump(encoder_qWeight,f)
-        encoder = graph.set_quantized_weights(encoder,f'{model_dir}/encoder_'+name+'.pkl')
     graph.write_frozen_dummy_enc(encoder,'encoder_'+name+'.pb',logdir = model_dir)
-    graph.write_frozen_dummy_enc(encoder,'encoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
     graph.write_frozen_graph_dec(decoder,'decoder_'+name+'.pb',logdir = model_dir)
-    graph.write_frozen_graph_dec(decoder,'decoder_'+name+'.pb.ascii',logdir = model_dir,asText=True)
 
-    graph.plot_weights(encoder,outdir = model_dir)
-    graph.plot_weights(decoder,outdir = model_dir)
     
 
 def load_matching_state_dict(model, state_dict_path):
@@ -94,16 +87,38 @@ model_dir = args.mpath + '_CMSSW'
 
 if not os.path.exists(model_dir):
     os.system("mkdir -p "+model_dir)
-
-for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
-     
-    bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
     
-    print(f'Processing Model with {eLinks} eLinks')
-    model_dir = os.path.join(args.mpath + '_CMSSW', f'model_{eLinks}_eLinks')
+    
+if args.specific_m is not None:
+    all_models = [args.specific_m]
+elif args.model_per_eLink:
+    if args.alloc_geom == 'old':
+        all_models = [2,3,4,5]
+    elif args.alloc_geom =='new':
+        all_models = [1,2,3,4,5,6,7,8,9,10,11]
+elif args.model_per_bit_config:
+    if args.alloc_geom == 'old':
+        all_models = [3,5,7,9]
+    elif args.alloc_geom =='new':
+        all_models = [1,3,5,7,9]
+
+
+       
+bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]    
+
+for m in all_models:
+    if args.model_per_eLink:
+        eLinks = m
+        bitsPerOutput = bitsPerOutputLink[eLinks]
+        print(f'Training Model with {eLinks} eLinks')
+        model_dir = os.path.join(args.mpath+'_CMSSW', f'model_{eLinks}_eLinks')
+    elif args.model_per_bit_config:
+        bitsPerOutput = m
+        print(f'Training Model with {bitsPerOutput} output bits')
+        model_dir = os.path.join(args.mpath+'_CMSSW', f'model_{bitsPerOutput}_bits')
+    
     if not os.path.exists(model_dir):
         os.system("mkdir -p " + model_dir)
-    bitsPerOutput = bitsPerOutputLink[eLinks]
     nIntegerBits = 1;
     nDecimalBits = bitsPerOutput - nIntegerBits;
     outputSaturationValue = (1 << nIntegerBits) - 1./(1 << nDecimalBits);
@@ -179,26 +194,34 @@ for eLinks in [1,2,3,4,5,6,7,8,9,10,11]:
     encoder = keras.Model([input_enc], latent, name="encoder")
     decoder = keras.Model([input_dec], recon, name="decoder")
 
-#     cae = Model(
-#         inputs=[input_enc],
-#         outputs=decoder([encoder([input_enc])]),
-#         name="cae"
-#     )
 
-    encoder_path = os.path.join(args.mpath,f'model_{eLinks}_eLinks','best-encoder-epoch.tf')
-    encoder.load_weights(encoder_path)
-    
-    decoder_path = os.path.join(args.mpath,f'model_{eLinks}_eLinks','best-decoder-epoch.tf')
-    decoder.load_weights(decoder_path)
+    if args.load_from_scan:
+        if args.model_per_eLink:
+            model_path = os.path.join(model_dir.split('_CMSSW')[0],f'model_{m}_eLinks', 'best_model.h5')
+        elif args.model_per_bit_config:
+            model_path = os.path.join(model_dir.split('_CMSSW')[0],f'model_{m}_eLinks', 'best_model.h5')
+        encoder.load_weights(model_path, by_name=True, skip_mismatch=True)
+        decoder.load_weights(model_path, by_name=True, skip_mismatch=True)
+
+    else:
+
+        if args.model_per_eLink:
+            encoder_path = os.path.join(args.mpath,f'model_{m}_eLinks','best-encoder-epoch.tf')
+            decoder_path = os.path.join(args.mpath,f'model_{m}_eLinks','best-decoder-epoch.tf')
+
+        elif args.model_per_bit_config:
+            encoder_path = os.path.join(args.mpath,f'model_{m}_bits','best-encoder-epoch.tf')
+            decoder_path = os.path.join(args.mpath,f'model_{m}_bits','best-decoder-epoch.tf')
+
+
+        encoder.load_weights(encoder_path)
+
+        decoder.load_weights(decoder_path)
     
     loss = telescopeMSE8x8
     
     opt = tf.keras.optimizers.Adam(learning_rate = 0.1,weight_decay = 0.000025)
-#     cae.compile(optimizer=opt, loss=loss)
-#     cae.summary()
 
     print('loaded model')
     save_models(encoder,decoder,args.mname,isQK = True)
-    
-#     save_models(cae,args.mname,isQK = True)
 
